@@ -126,7 +126,7 @@ class Evaluation(unittest.TestCase):
         self.assertEqual(self.st().firing, {"urn:a"})
         self.assertEqual(self.st().evaluations["unknown"], 1)
         self.assertEqual(self.st().last_success, 1.0)  # no fresh answer, so no fresh success
-        self.assertIn('chaski_rule_firing{rule="r",focus="urn:a",severity="warning"} 1',
+        self.assertIn('chaski_rule_firing{rule="r",focus="urn:a",severity="warning",keeper="ops"} 1',
                       self.reactor.metrics())
 
     def test_chaski_only_calls_public_read_endpoints(self):

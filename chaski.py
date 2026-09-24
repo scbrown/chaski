@@ -234,8 +234,9 @@ class Reactor:
             ]
             for r in self.rules:
                 for f in sorted(self.states[r.label].firing):
+                    # keeper = the rule's owner, so Alertmanager routes by who acts on it.
                     lines.append(f'chaski_rule_firing{{rule="{_esc(r.label)}",focus="{_esc(f)}",'
-                                 f'severity="{r.severity}"}} 1')
+                                 f'severity="{r.severity}",keeper="{_esc(r.owner)}"}} 1')
             lines += ["# HELP chaski_rule_evaluations_total Evaluations by result; unknown = could not look.",
                       "# TYPE chaski_rule_evaluations_total counter"]
             for r in self.rules:
