@@ -1,0 +1,32 @@
+# chaski rules. Field names mirror the aegis:Reaction shape 1:1, so these can
+# later be loaded into quipu as facts unchanged.
+#
+# condition: a SPARQL SELECT ?focus. The result is the set of nodes the rule
+# is firing for RIGHT NOW. A node leaving the set resolves the alert.
+
+rules:
+  # The canary proves chaski is evaluating, not merely running. It must return
+  # at least one row every cycle; alert when its last success goes stale
+  # (chaski_last_success_timestamp_seconds{rule="chaski-canary"}).
+  - label: chaski-canary
+    triggerKind: schedule
+    schedule: PT1M
+    condition: "SELECT ?focus WHERE { ?focus a ?type } LIMIT 1"
+    severity: info
+    action: alert
+    owner: chaski
+    comment: Liveness by output. Firing is the healthy state.
+
+  - label: example-stale-thing
+    triggerKind: schedule
+    schedule: PT15M
+    condition: >-
+      SELECT ?focus WHERE {
+        ?focus a <https://example.org/Thing> ;
+               <https://example.org/lastVerifiedAt> ?t .
+        FILTER(?t < "2026-01-01T00:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>)
+      }
+    severity: warning
+    action: alert
+    owner: example
+    enabled: false
