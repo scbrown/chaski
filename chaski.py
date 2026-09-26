@@ -26,8 +26,12 @@ import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
+
+if TYPE_CHECKING:
+    import emitter
 
 LOG = logging.getLogger("chaski")
 
@@ -290,7 +294,7 @@ def serve_metrics(reactor: Reactor, port: int) -> ThreadingHTTPServer:
     return server
 
 
-def load_emitters(path: Path) -> list[tuple["emitter.Emitter", dict]]:
+def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
     """Stage 2 emitters (see emitter.py). Separate from `rules` on purpose: a
     rule is a SPARQL condition mirroring aegis:Reaction; an emitter runs an
     external verdict adapter and owns transition state."""
