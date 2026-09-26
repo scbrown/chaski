@@ -159,6 +159,7 @@ class Reactor:
         self.event_errors = 0
         self.last_event_poll = 0.0
         self.lock = threading.Lock()
+        self.runners: list = []  # stage 2 emitters, attached by main()
 
     def _load_cursor(self) -> int:
         try:
@@ -225,6 +226,8 @@ class Reactor:
             for rule in self.rules:
                 if rule.label in due:
                     self.evaluate(rule, now)
+            for runner in self.runners:
+                runner.tick(now)
 
     def metrics(self) -> str:
         with self.lock:
@@ -254,6 +257,11 @@ class Reactor:
                       "# TYPE chaski_events_lag gauge", f"chaski_events_lag {self.event_lag}",
                       "# TYPE chaski_event_poll_errors_total counter",
                       f"chaski_event_poll_errors_total {self.event_errors}"]
+            if self.runners:
+                lines += ["# HELP chaski_emitter_outbox_pending Events queued and not yet received.",
+                          "# TYPE chaski_emitter_outbox_pending gauge"]
+                for runner in self.runners:
+                    lines += runner.metrics(_esc)
             return "\n".join(lines) + "\n"
 
 
@@ -282,6 +290,27 @@ def serve_metrics(reactor: Reactor, port: int) -> ThreadingHTTPServer:
     return server
 
 
+def load_emitters(path: Path) -> list[tuple["emitter.Emitter", dict]]:
+    """Stage 2 emitters (see emitter.py). Separate from `rules` on purpose: a
+    rule is a SPARQL condition mirroring aegis:Reaction; an emitter runs an
+    external verdict adapter and owns transition state."""
+    import emitter
+
+    doc = yaml.safe_load(path.read_text()) or {}
+    out = []
+    for d in doc.get("emitters", []):
+        missing = [f for f in ("label", "command", "schedule", "owner", "sink") if not d.get(f)]
+        if missing:
+            raise RuleError(f"emitter {d.get('label', '?')!r} is missing {missing}")
+        if set(d["sink"]) != {"jsonl"}:
+            raise RuleError(f"emitter {d['label']}: sink must be {{jsonl: <path>}}")
+        e = emitter.Emitter(label=d["label"], command=list(d["command"]),
+                            interval_s=parse_duration(d["schedule"]), owner=d["owner"],
+                            event=d.get("event", "unblocked"), timeout_s=int(d.get("timeout_s", 300)))
+        out.append((e, d["sink"]))
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--quipu", required=True, help="quipu base URL")
@@ -291,11 +320,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--event-poll", type=int, default=MIN_EVENT_POLL_S,
                     help=f"seconds between event polls (floor {MIN_EVENT_POLL_S})")
     ap.add_argument("--once", action="store_true", help="evaluate every rule once, print metrics, exit")
+    ap.add_argument("--emitters", type=Path, help="stage 2 emitters YAML (optional)")
+    ap.add_argument("--emitter-db", type=Path, help="emitter state (default: beside --state)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     rules = load_rules(args.rules)
     reactor = Reactor(Quipu(args.quipu), rules, args.state, args.event_poll)
+    if args.emitters:
+        import emitter
+
+        conn = emitter.connect(args.emitter_db or args.state.with_name("emitter.db"))
+        reactor.runners = [emitter.Runner(e, conn, emitter.JsonlSink(sink["jsonl"]))
+                           for e, sink in load_emitters(args.emitters)]
     LOG.info("chaski: %d rule(s), event poll %ds", len(rules), reactor.event_poll_s)
     if args.once:
         now = time.time()

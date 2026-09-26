@@ -40,6 +40,23 @@ alert, so alerts resolve on their own.
 Stage 1: a read-only skeleton, with the event tail, schedule rules, metrics and
 the canary. No writes and no pages yet.
 
+Stage 2 (in progress): **emitters** (`emitter.py`). An emitter runs an external
+verdict adapter on a schedule and turns its answers into transition events. A
+first sighting is a baseline, "unknown" keeps the last verdict, and only a
+known blocked-to-unblocked transition emits. Verdict and outbox commit in one
+transaction. Delivery is at least once to a receiver that deduplicates on the
+adapter's deterministic event id. Configure with `--emitters emitters.yaml`:
+
+```yaml
+emitters:
+  - label: workitem-unblocked
+    command: [python3, /path/to/blocked_by.py]
+    schedule: PT15M
+    owner: someone
+    event: unblocked
+    sink: {jsonl: /var/lib/chaski/unblocked.jsonl}
+```
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
