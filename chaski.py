@@ -230,8 +230,10 @@ class Reactor:
             for rule in self.rules:
                 if rule.label in due:
                     self.evaluate(rule, now)
-            for runner in self.runners:
-                runner.tick(now)
+        # OUTSIDE the lock: an adapter run takes minutes, and metrics() takes
+        # this lock. Runners publish their own snapshots for the scrape.
+        for runner in self.runners:
+            runner.tick(now)
 
     def metrics(self) -> str:
         with self.lock:
@@ -355,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--once", action="store_true", help="evaluate every rule once, print metrics, exit")
     ap.add_argument("--emitters", type=Path, help="stage 2 emitters YAML (optional)")
     ap.add_argument("--emitter-db", type=Path, help="emitter state (default: beside --state)")
+    ap.add_argument("--emitter-write-interval", type=float, default=5.0,
+                    help="GLOBAL minimum seconds between sink writes, across all emitters")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -364,7 +368,8 @@ def main(argv: list[str] | None = None) -> int:
         import emitter
 
         conn = emitter.connect(args.emitter_db or args.state.with_name("emitter.db"))
-        reactor.runners = [emitter.Runner(e, conn, make_sink(e, sink, args.quipu))
+        budget = emitter.WriteBudget(args.emitter_write_interval)  # ONE, shared by all
+        reactor.runners = [emitter.Runner(e, conn, make_sink(e, sink, args.quipu), budget)
                            for e, sink in load_emitters(args.emitters)]
     LOG.info("chaski: %d rule(s), event poll %ds", len(rules), reactor.event_poll_s)
     if args.once:

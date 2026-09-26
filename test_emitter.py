@@ -132,9 +132,9 @@ class Delivery(unittest.TestCase):
         self.h.run([rec("a", "UNBLOCKED", "id-a1")])
 
     def test_delivered_only_after_the_sink_returns(self):
-        self.assertEqual(em.deliver_pending(self.h.conn, self.h.sink, now=2.0), (1, 0))
+        self.assertEqual(em.deliver_pending(self.h.conn, self.h.sink, emitter="unblocked", now=2.0), (1, 0))
         self.assertEqual(self.h.sink.ids(), {"id-a1"})
-        self.assertEqual(em.deliver_pending(self.h.conn, self.h.sink, now=3.0), (0, 0))
+        self.assertEqual(em.deliver_pending(self.h.conn, self.h.sink, emitter="unblocked", now=3.0), (0, 0))
 
     def test_sabotage_send_then_lost_ack_then_rerun_gives_exactly_one_at_the_receiver(self):
         # The sink RECEIVES the event, then the sender dies before its checkpoint.
@@ -146,10 +146,10 @@ class Delivery(unittest.TestCase):
                 self.inner.deliver(event)
                 raise ConnectionError("killed before the ack")
 
-        self.assertEqual(em.deliver_pending(self.h.conn, LostAck(self.h.sink), now=2.0), (0, 1))
+        self.assertEqual(em.deliver_pending(self.h.conn, LostAck(self.h.sink), emitter="unblocked", now=2.0), (0, 1))
         self.h.restart()
         # The retry re-sends the SAME id after backoff; the receiver dedupes.
-        self.assertEqual(em.deliver_pending(self.h.conn, self.h.sink, now=10_000.0), (1, 0))
+        self.assertEqual(em.deliver_pending(self.h.conn, self.h.sink, emitter="unblocked", now=10_000.0), (1, 0))
         lines = self.h.sink.path.read_text().splitlines()
         self.assertEqual(len(lines), 1, "exactly one event at the deduping receiver")
 
@@ -166,8 +166,8 @@ class Delivery(unittest.TestCase):
                 got.append(event["event_id"])
                 raise ConnectionError("killed before the ack")
 
-        em.deliver_pending(self.h.conn, LostAck(), now=2.0)
-        em.deliver_pending(self.h.conn, Naive(), now=10_000.0)
+        em.deliver_pending(self.h.conn, LostAck(), emitter="unblocked", now=2.0)
+        em.deliver_pending(self.h.conn, Naive(), emitter="unblocked", now=10_000.0)
         self.assertEqual(got, ["id-a1", "id-a1"])
 
     def test_a_failing_sink_backs_off_and_keeps_the_row(self):
@@ -175,13 +175,13 @@ class Delivery(unittest.TestCase):
             def deliver(self, event):
                 raise OSError("receiver down")
 
-        self.assertEqual(em.deliver_pending(self.h.conn, Down(), now=2.0), (0, 1))
+        self.assertEqual(em.deliver_pending(self.h.conn, Down(), emitter="unblocked", now=2.0), (0, 1))
         attempts, nxt, err = self.h.conn.execute(
             "SELECT attempts, next_attempt, last_error FROM outbox").fetchone()
         self.assertEqual((attempts, nxt), (1, 2.0 + em.BASE_BACKOFF_S))
         self.assertIn("receiver down", err)
         # Not due yet: no attempt.
-        self.assertEqual(em.deliver_pending(self.h.conn, Down(), now=3.0), (0, 0))
+        self.assertEqual(em.deliver_pending(self.h.conn, Down(), emitter="unblocked", now=3.0), (0, 0))
 
 
 class RunnerTests(unittest.TestCase):
@@ -311,3 +311,124 @@ class Retransition(unittest.TestCase):
         old.close()
         h.conn = em.connect(h.db)
         self.assertEqual(h.run([rec("a", "UNBLOCKED", "id-a1")]), ["id-a1"])
+
+
+class MultiEmitter(unittest.TestCase):
+    """Owner review (malcolm, ab10bf16): runners share one state database, so
+    delivery, retry and checkpoint must be scoped to the owning emitter."""
+
+    def two(self):
+        h = Harness()
+        a = em.Emitter(label="alpha", owner="o", interval_s=0, command=h.emitter.command)
+        b = em.Emitter(label="beta", owner="o", interval_s=0, command=h.emitter.command)
+        for e, eid in ((a, "id-alpha"), (b, "id-beta")):
+            h.out.write_text(json.dumps([rec("x", "BLOCKED")]))
+            em.observe(h.conn, e, em.run_adapter(e), 1.0)
+            h.out.write_text(json.dumps([rec("x", "UNBLOCKED", eid)]))
+            em.observe(h.conn, e, em.run_adapter(e), 2.0)
+        return h, a, b
+
+    def test_each_sink_receives_only_its_own_emitters_events(self):
+        h, a, b = self.two()
+        got = {"alpha": [], "beta": []}
+
+        class S:
+            def __init__(self, name):
+                self.name = name
+
+            def deliver(self, event):
+                got[self.name].append(event["emitter"])
+
+        self.assertEqual(em.deliver_pending(h.conn, S("alpha"), 3.0, "alpha"), (1, 0))
+        self.assertEqual(got, {"alpha": ["alpha"], "beta": []})
+        # beta's row is still undelivered and reaches beta's sink.
+        self.assertEqual(em.deliver_pending(h.conn, S("beta"), 3.0, "beta"), (1, 0))
+        self.assertEqual(got, {"alpha": ["alpha"], "beta": ["beta"]})
+
+    def test_a_retry_is_charged_and_checkpointed_to_its_own_emitter(self):
+        h, a, b = self.two()
+
+        class Down:
+            def deliver(self, event):
+                raise OSError("down")
+
+        em.deliver_pending(h.conn, Down(), 3.0, "alpha")
+        rows = dict(h.conn.execute("SELECT emitter, attempts FROM outbox").fetchall())
+        self.assertEqual(rows, {"alpha": 1, "beta": 0})
+
+
+class ConcurrencyAndBudget(unittest.TestCase):
+    def test_metrics_from_another_thread_never_touch_sqlite(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        h = Harness()
+        r = em.Runner(h.emitter, h.conn, h.sink)
+        with ThreadPoolExecutor(1) as pool:
+            text = "\n".join(pool.submit(r.metrics, lambda s: s).result(timeout=5))
+        self.assertIn("chaski_emitter_outbox_pending", text)
+
+    def test_a_blocked_adapter_does_not_block_a_real_metrics_scrape(self):
+        import threading
+        import time as t
+        import urllib.request
+
+        import chaski
+
+        h = Harness()
+        h.out.write_text(json.dumps([]))
+        # The adapter sleeps 3 s: an adapter run is ~90 s in production.
+        h.emitter.command = [sys.executable, "-c", "import time; time.sleep(3); print('[]')"]
+        reactor = chaski.Reactor(chaski.Quipu("http://127.0.0.1:9"), [], h.dir / "cursor", 60)
+        reactor.last_event_poll = float("inf")
+        # The runner (and its SQLite connection) live on the ticking thread.
+        conn_holder = {}
+
+        def tick_in_thread():
+            conn = em.connect(h.dir / "blocked.db")
+            reactor.runners = [em.Runner(h.emitter, conn, h.sink)]
+            conn_holder["ready"] = True
+            reactor.tick(100.0)
+
+        server = chaski.serve_metrics(reactor, 0)
+        port = server.server_address[1]
+        th = threading.Thread(target=tick_in_thread)
+        th.start()
+        while "ready" not in conn_holder:
+            t.sleep(0.01)
+        t.sleep(0.3)  # the adapter is now running
+        started = t.monotonic()
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as resp:
+            body = resp.read().decode()
+        elapsed = t.monotonic() - started
+        th.join()
+        server.shutdown()
+        self.assertLess(elapsed, 1.0, f"scrape waited {elapsed:.2f}s behind the adapter")
+        self.assertIn("chaski_emitter_runs_total", body)
+
+    def test_the_write_budget_is_global_across_emitters_and_counts_setup(self):
+        h, a, b = MultiEmitter.two(self)
+        budget = em.WriteBudget(5.0)
+        writes = []
+
+        class Sink:
+            def __init__(self):
+                self.ready = False
+
+            def setup_pending(self):
+                return not self.ready
+
+            def setup(self):
+                writes.append(("setup", now))
+                self.ready = True
+
+            def deliver(self, event):
+                writes.append((event["emitter"], now))
+
+        sa, sb = Sink(), Sink()
+        for now in [float(x) for x in range(3, 30)]:
+            em.deliver_pending(h.conn, sa, now, "alpha", budget)
+            em.deliver_pending(h.conn, sb, now, "beta", budget)
+        times = [w[1] for w in writes]
+        self.assertEqual(len(writes), 4, writes)  # 2 setups + 2 events, one per slot
+        self.assertTrue(all(b - a >= 5.0 for a, b in zip(times, times[1:])), times)
+        self.assertEqual([w[0] for w in writes].count("setup"), 2)

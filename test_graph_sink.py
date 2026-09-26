@@ -140,14 +140,35 @@ class ThroughTheEmitter(unittest.TestCase):
             em.observe(conn, e, em.run_adapter(e), 1.0)
         sink = gs.QuipuFiringSink(q.url, "t", REACTION, timeout=5)
         q.mode = "empty"
-        self.assertEqual(em.deliver_pending(conn, sink, now=2.0), (0, 1))
+        self.assertEqual(em.deliver_pending(conn, sink, now=2.0, emitter=REACTION["label"]), (0, 1))
         q.mode = "ok"
-        self.assertEqual(em.deliver_pending(conn, sink, now=10_000.0), (1, 0))
+        self.assertEqual(em.deliver_pending(conn, sink, now=10_000.0, emitter=REACTION["label"]), (1, 0))
         self.assertEqual(len(q.firings()), 1)
         q.server.shutdown()
 
 
 class Load(unittest.TestCase):
+    def test_the_reaction_write_takes_its_own_budget_slot(self):
+        q = FakeQuipu()
+        d = Path(tempfile.mkdtemp())
+        out = d / "adapter.json"
+        e = em.Emitter(label=REACTION["label"], owner="wu", interval_s=0,
+                       command=[sys.executable, "-c", "import sys; print(open(sys.argv[1]).read())", str(out)])
+        conn = em.connect(d / "state.db")
+        for recs in ([{"item": "aegis-abc123", "verdict": "BLOCKED"}],
+                     [{"item": "aegis-abc123", "verdict": "UNBLOCKED", "event_id": "sha256:aa"}]):
+            out.write_text(json.dumps(recs))
+            em.observe(conn, e, em.run_adapter(e), 1.0)
+        sink = gs.QuipuFiringSink(q.url, "t", REACTION, timeout=5)
+        budget = em.WriteBudget(5.0)
+        self.assertEqual(em.deliver_pending(conn, sink, 10.0, e.label, budget), (0, 0))
+        self.assertEqual((q.knots, len(q.firings())), (1, 0), "slot 1: the Reaction only")
+        self.assertEqual(em.deliver_pending(conn, sink, 12.0, e.label, budget), (0, 0))
+        self.assertEqual(q.knots, 1, "no slot free 2 s later")
+        self.assertEqual(em.deliver_pending(conn, sink, 15.0, e.label, budget), (1, 0))
+        self.assertEqual((q.knots, len(q.firings())), (2, 1), "slot 2: the firing")
+        q.server.shutdown()
+
     def test_the_sink_sends_its_own_client_label(self):
         self.assertEqual(gs.CLIENT_LABEL, "chaski-emitter")
 

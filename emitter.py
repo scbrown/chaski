@@ -42,6 +42,7 @@ import json
 import logging
 import sqlite3
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,39 +269,87 @@ class JsonlSink:
             f.flush()
 
 
-def deliver_pending(conn: sqlite3.Connection, sink: Sink, now: float, limit: int = 50) -> tuple[int, int]:
-    """Send due outbox rows. Returns (delivered, failed)."""
+class WriteBudget:
+    """ONE budget shared by every emitter in the process: at most one sink
+    write per `interval_s`, globally. quipu applies writes one at a time, so the
+    bound that matters is the reactor's, not each emitter's. A retry spends
+    budget like a first attempt, and so does a sink's one-time setup write."""
+
+    def __init__(self, interval_s: float):
+        self.interval_s = interval_s
+        self._last = float("-inf")
+        self._lock = threading.Lock()
+
+    def try_take(self, now: float) -> bool:
+        with self._lock:
+            if now - self._last < self.interval_s:
+                return False
+            self._last = now
+            return True
+
+
+def deliver_pending(conn: sqlite3.Connection, sink: Sink, now: float, emitter: str,
+                    budget: WriteBudget | None = None, limit: int = 50) -> tuple[int, int]:
+    """Send THIS emitter's due outbox rows to THIS emitter's sink, spending one
+    budget slot per write. Returns (delivered, failed).
+
+    Scoped by emitter because runners share one state database: an unscoped
+    pass would hand another emitter's events to this sink and checkpoint them
+    there, so their own sink would never see them."""
+    # A sink may owe a one-time setup write (the graph sink's Reaction). It
+    # takes its own budget slot, never piggy-backing on an event's.
+    setup = getattr(sink, "setup_pending", None)
+    if setup is not None and setup():
+        if budget is not None and not budget.try_take(now):
+            return 0, 0
+        try:
+            sink.setup()
+        except Exception as exc:  # noqa: BLE001 — retried next pass, no row is charged
+            LOG.warning("sink setup for %s failed: %s", emitter, exc)
+            return 0, 1
     rows = conn.execute(
-        "SELECT event_id, payload, attempts FROM outbox WHERE delivered_at IS NULL AND next_attempt <= ?"
-        " ORDER BY created LIMIT ?", (now, limit)).fetchall()
+        "SELECT event_id, payload, attempts FROM outbox WHERE emitter = ? AND delivered_at IS NULL"
+        " AND next_attempt <= ? ORDER BY created LIMIT ?", (emitter, now, limit)).fetchall()
     ok = failed = 0
     for event_id, payload, attempts in rows:
+        if budget is not None and not budget.try_take(now):
+            break  # the rest wait for a later slot; nothing is charged to them
         try:
             sink.deliver(json.loads(payload))
         except Exception as exc:  # noqa: BLE001 — any failure is a retry
             failed += 1
             backoff = min(MAX_BACKOFF_S, BASE_BACKOFF_S * 2 ** attempts)
-            conn.execute("UPDATE outbox SET attempts=attempts+1, next_attempt=?, last_error=? WHERE event_id=?",
-                         (now + backoff, str(exc)[:300], event_id))
+            conn.execute("UPDATE outbox SET attempts=attempts+1, next_attempt=?, last_error=?"
+                         " WHERE event_id=? AND emitter=?",
+                         (now + backoff, str(exc)[:300], event_id, emitter))
             LOG.warning("delivery of %s failed (attempt %d): %s", event_id, attempts + 1, exc)
             continue
         # Only now, after the sink returned on a receipt. A crash before this
         # line re-sends the same id next time; the receiver deduplicates.
-        conn.execute("UPDATE outbox SET delivered_at=?, attempts=attempts+1 WHERE event_id=?",
-                     (now, event_id))
+        conn.execute("UPDATE outbox SET delivered_at=?, attempts=attempts+1 WHERE event_id=? AND emitter=?",
+                     (now, event_id, emitter))
         ok += 1
     return ok, failed
 
 
 class Runner:
-    """Schedules one emitter's adapter runs and deliveries, and counts them."""
+    """Schedules one emitter's adapter runs and deliveries, and counts them.
 
-    def __init__(self, emitter: Emitter, conn: sqlite3.Connection, sink: Sink):
-        self.emitter, self.conn, self.sink = emitter, conn, sink
+    tick() runs on the reactor's thread and may take minutes (the adapter).
+    metrics() runs on the HTTP thread and must never block on it or touch the
+    SQLite connection (which belongs to the ticking thread), so tick()
+    publishes a snapshot under a small lock and metrics() only reads that."""
+
+    def __init__(self, emitter: Emitter, conn: sqlite3.Connection, sink: Sink,
+                 budget: WriteBudget | None = None):
+        self.emitter, self.conn, self.sink, self.budget = emitter, conn, sink, budget
         self.last_attempt = 0.0
         self.last_success = 0.0
         self.runs = {"ok": 0, "unknown": 0}
         self.queued_total = 0
+        self._snap_lock = threading.Lock()
+        self._snapshot: dict = {}
+        self._publish()
 
     def tick(self, now: float) -> None:
         if now - self.last_attempt >= self.emitter.interval_s:
@@ -313,22 +362,33 @@ class Runner:
             except Exception as exc:  # noqa: BLE001 — a failed run is UNKNOWN for every item
                 self.runs["unknown"] += 1
                 LOG.warning("emitter %s UNKNOWN (no verdict changed): %s", self.emitter.label, exc)
-        deliver_pending(self.conn, self.sink, now, limit=DELIVER_PER_TICK)
+        deliver_pending(self.conn, self.sink, now, self.emitter.label, self.budget, limit=DELIVER_PER_TICK)
+        self._publish()
 
-    def metrics(self, esc) -> list[str]:
-        label = esc(self.emitter.label)
+    def _publish(self) -> None:
         pending, oldest = self.conn.execute(
             "SELECT COUNT(*), MIN(created) FROM outbox WHERE emitter=? AND delivered_at IS NULL",
             (self.emitter.label,)).fetchone()
         delivered = self.conn.execute(
             "SELECT COUNT(*) FROM outbox WHERE emitter=? AND delivered_at IS NOT NULL",
             (self.emitter.label,)).fetchone()[0]
-        lines = [f'chaski_emitter_runs_total{{emitter="{label}",result="{r}"}} {n}' for r, n in self.runs.items()]
+        snap = {"runs": dict(self.runs), "last_success": self.last_success,
+                "queued_total": self.queued_total, "pending": pending,
+                "oldest_created": oldest, "delivered": delivered}
+        with self._snap_lock:
+            self._snapshot = snap
+
+    def metrics(self, esc) -> list[str]:
+        with self._snap_lock:
+            s = dict(self._snapshot)
+        label = esc(self.emitter.label)
+        lines = [f'chaski_emitter_runs_total{{emitter="{label}",result="{r}"}} {n}' for r, n in s["runs"].items()]
+        oldest = s["oldest_created"]
         lines += [
-            f'chaski_emitter_last_success_timestamp_seconds{{emitter="{label}"}} {self.last_success:.0f}',
-            f'chaski_emitter_events_queued_total{{emitter="{label}"}} {self.queued_total}',
-            f'chaski_emitter_outbox_pending{{emitter="{label}"}} {pending}',
-            f'chaski_emitter_outbox_delivered_total{{emitter="{label}"}} {delivered}',
+            f'chaski_emitter_last_success_timestamp_seconds{{emitter="{label}"}} {s["last_success"]:.0f}',
+            f'chaski_emitter_events_queued_total{{emitter="{label}"}} {s["queued_total"]}',
+            f'chaski_emitter_outbox_pending{{emitter="{label}"}} {s["pending"]}',
+            f'chaski_emitter_outbox_delivered_total{{emitter="{label}"}} {s["delivered"]}',
             f'chaski_emitter_outbox_oldest_pending_age_seconds{{emitter="{label}"}} '
             f'{(time.time() - oldest) if oldest else 0:.0f}',
         ]

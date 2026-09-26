@@ -107,10 +107,20 @@ class QuipuFiringSink:
             raise ConnectionError(f"read-back returned no rows field: {str(out)[:200]}")
         return any(str(r.get("e")) == event["event_id"] for r in rows)
 
+    def setup_pending(self) -> bool:
+        """The Reaction every firing points at is owed once per process. The
+        emitter spends a write-budget slot on it, separately from any event."""
+        return not self._reaction_written
+
+    def setup(self) -> None:
+        self._knot(self.reaction_turtle(), f"chaski:reaction:{self.reaction['label']}")
+        self._reaction_written = True
+
     def deliver(self, event: dict) -> None:
         if not self._reaction_written:
-            self._knot(self.reaction_turtle(), f"chaski:reaction:{self.reaction['label']}")
-            self._reaction_written = True
+            # Called outside deliver_pending (a direct caller): still correct,
+            # just not budgeted separately.
+            self.setup()
         iri = firing_iri(self.reaction["label"], event["event_id"], self.ns)
         self._knot(self.firing_turtle(event), iri)
         if not self._received(event):
