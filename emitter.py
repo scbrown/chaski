@@ -50,7 +50,6 @@ from typing import Protocol
 LOG = logging.getLogger("chaski.emitter")
 
 BLOCKED, UNBLOCKED, UNKNOWN = "BLOCKED", "UNBLOCKED", "UNKNOWN"
-VERDICTS = {BLOCKED, UNBLOCKED, UNKNOWN}
 MAX_BACKOFF_S = 3600
 BASE_BACKOFF_S = 30
 
@@ -62,6 +61,7 @@ CREATE TABLE IF NOT EXISTS verdicts (
     generation INTEGER NOT NULL,
     evidence   TEXT,
     tracked    INTEGER NOT NULL DEFAULT 1,
+    last_event TEXT,
     updated    REAL NOT NULL,
     PRIMARY KEY (emitter, item)
 );
@@ -86,8 +86,15 @@ class ProtocolError(ValueError):
 
 @dataclass
 class Emitter:
-    """One adapter, run on a schedule. `event` names what a BLOCKED -> UNBLOCKED
-    transition means to consumers (for example "unblocked")."""
+    """One adapter, run on a schedule.
+
+    `key` names the record field that identifies an item ("item" for the
+    blocked-by adapter, "entity" for the review-age one). A transition from
+    `from_verdict` to `to_verdict` is the event, named `event` for consumers.
+    `baseline_emits` makes a first sighting already in `to_verdict` an event
+    too: right for "this is overdue" (the owner must hear it however late we
+    met it), wrong for "this became unblocked" (we did not see it happen).
+    """
 
     label: str
     command: list[str]
@@ -95,12 +102,23 @@ class Emitter:
     owner: str
     event: str = "unblocked"
     timeout_s: int = 300
+    key: str = "item"
+    from_verdict: str = BLOCKED
+    to_verdict: str = UNBLOCKED
+    baseline_emits: bool = False
+
+    @property
+    def verdicts(self) -> set[str]:
+        return {self.from_verdict, self.to_verdict, UNKNOWN}
 
 
 def connect(path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), isolation_level=None)  # explicit transactions below
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(verdicts)")}
+    if "last_event" not in cols:  # a state file from before last_event existed
+        conn.execute("ALTER TABLE verdicts ADD COLUMN last_event TEXT")
     return conn
 
 
@@ -116,20 +134,21 @@ def run_adapter(emitter: Emitter) -> list[dict]:
     return records
 
 
-def _validate(records: list[dict]) -> None:
+def _validate(emitter: Emitter, records: list[dict]) -> None:
     seen = set()
     for r in records:
-        if not isinstance(r, dict) or not isinstance(r.get("item"), str) or not r["item"]:
-            raise ProtocolError(f"record without an item: {str(r)[:120]}")
-        if r.get("verdict") not in VERDICTS:
-            raise ProtocolError(f"{r['item']}: verdict {r.get('verdict')!r} not in {sorted(VERDICTS)}")
-        if r["verdict"] == UNBLOCKED and not r.get("event_id"):
+        if not isinstance(r, dict) or not isinstance(r.get(emitter.key), str) or not r[emitter.key]:
+            raise ProtocolError(f"record without {emitter.key!r}: {str(r)[:120]}")
+        item = r[emitter.key]
+        if r.get("verdict") not in emitter.verdicts:
+            raise ProtocolError(f"{item}: verdict {r.get('verdict')!r} not in {sorted(emitter.verdicts)}")
+        if r["verdict"] == emitter.to_verdict and not r.get("event_id"):
             # Without a deterministic id the receiver cannot deduplicate, and a
             # send-time id would make at-least-once delivery at-least-twice.
-            raise ProtocolError(f"{r['item']}: UNBLOCKED without event_id")
-        if r["item"] in seen:
-            raise ProtocolError(f"{r['item']}: listed twice in one run")
-        seen.add(r["item"])
+            raise ProtocolError(f"{item}: {emitter.to_verdict} without event_id")
+        if item in seen:
+            raise ProtocolError(f"{item}: listed twice in one run")
+        seen.add(item)
 
 
 def observe(conn: sqlite3.Connection, emitter: Emitter, records: list[dict], now: float) -> list[str]:
@@ -138,16 +157,35 @@ def observe(conn: sqlite3.Connection, emitter: Emitter, records: list[dict], now
     All-or-nothing: a protocol error leaves every verdict and the outbox as
     they were.
     """
-    _validate(records)
+    _validate(emitter, records)
     queued: list[str] = []
+
+    def emit(r: dict, item: str, generation: int) -> None:
+        payload = {
+            "event_id": r["event_id"], "event": emitter.event, "emitter": emitter.label,
+            "item": item, "generation": generation,
+            # whoever the adapter says should act: the assignee of a work item,
+            # the owner of an aged entity
+            "recipient": r.get("assignee") or r.get("owner"),
+            "evidence": r.get("evidence"), "observed_at": now,
+        }
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO outbox (event_id, emitter, item, generation, payload, created)"
+            " VALUES (?,?,?,?,?,?)",
+            (r["event_id"], emitter.label, item, generation, json.dumps(payload, sort_keys=True), now))
+        conn.execute("UPDATE verdicts SET last_event=? WHERE emitter=? AND item=?",
+                     (r["event_id"], emitter.label, item))
+        if cur.rowcount:
+            queued.append(r["event_id"])
+
     conn.execute("BEGIN IMMEDIATE")
     try:
         present = set()
         for r in records:
-            item, verdict = r["item"], r["verdict"]
+            item, verdict = r[emitter.key], r["verdict"]
             present.add(item)
             row = conn.execute(
-                "SELECT verdict, generation, tracked FROM verdicts WHERE emitter=? AND item=?",
+                "SELECT verdict, generation, tracked, last_event FROM verdicts WHERE emitter=? AND item=?",
                 (emitter.label, item)).fetchone()
             if row is None or not row[2]:
                 if verdict == UNKNOWN:
@@ -158,31 +196,33 @@ def observe(conn: sqlite3.Connection, emitter: Emitter, records: list[dict], now
                     " verdict=excluded.verdict, evidence=excluded.evidence, tracked=1,"
                     " generation=generation+1, updated=excluded.updated",
                     (emitter.label, item, verdict, 0, r.get("evidence"), now))
+                if emitter.baseline_emits and verdict == emitter.to_verdict:
+                    gen = conn.execute("SELECT generation FROM verdicts WHERE emitter=? AND item=?",
+                                       (emitter.label, item)).fetchone()[0]
+                    emit(r, item, gen)
                 continue
-            last, generation = row[0], row[1]
+            last, generation, last_event = row[0], row[1], row[3]
             if verdict == UNKNOWN:
                 continue
             if verdict == last:
                 conn.execute("UPDATE verdicts SET evidence=?, updated=? WHERE emitter=? AND item=?",
                              (r.get("evidence"), now, emitter.label, item))
+                # Same verdict, NEW transition: it went away and came back
+                # between two runs (re-blocked and unblocked again; re-verified
+                # and lapsed again). The adapter's id says so; the verdict cannot.
+                if (verdict == emitter.to_verdict and last_event is not None
+                        and r["event_id"] != last_event):
+                    generation += 2
+                    conn.execute("UPDATE verdicts SET generation=? WHERE emitter=? AND item=?",
+                                 (generation, emitter.label, item))
+                    emit(r, item, generation)
                 continue
             generation += 1
             conn.execute(
                 "UPDATE verdicts SET verdict=?, generation=?, evidence=?, updated=? WHERE emitter=? AND item=?",
                 (verdict, generation, r.get("evidence"), now, emitter.label, item))
-            if last == BLOCKED and verdict == UNBLOCKED:
-                payload = {
-                    "event_id": r["event_id"], "event": emitter.event, "emitter": emitter.label,
-                    "item": item, "generation": generation, "assignee": r.get("assignee"),
-                    "evidence": r.get("evidence"), "observed_at": now,
-                }
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO outbox (event_id, emitter, item, generation, payload, created)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (r["event_id"], emitter.label, item, generation,
-                     json.dumps(payload, sort_keys=True), now))
-                if cur.rowcount:
-                    queued.append(r["event_id"])
+            if last == emitter.from_verdict and verdict == emitter.to_verdict:
+                emit(r, item, generation)
         for (item,) in conn.execute(
                 "SELECT item FROM verdicts WHERE emitter=? AND tracked=1", (emitter.label,)).fetchall():
             if item not in present:

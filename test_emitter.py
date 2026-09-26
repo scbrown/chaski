@@ -243,3 +243,71 @@ class Wiring(unittest.TestCase):
                                                  "command": ["true"]}]}))
         with self.assertRaises(chaski.RuleError):
             chaski.load_emitters(cfg)
+
+
+def due(entity, verdict, event_id=None):
+    r = {"entity": entity, "verdict": verdict, "owner": "keeper", "evidence": "e"}
+    if event_id:
+        r["event_id"] = event_id
+    return r
+
+
+class DueEmitter(unittest.TestCase):
+    """The review-age adapter (key 'entity', NOT_DUE -> DUE), with
+    baseline_emits: an entity already overdue when first seen still reaches
+    its owner."""
+
+    def setUp(self):
+        self.h = Harness()
+        self.h.emitter.key, self.h.emitter.event = "entity", "due"
+        self.h.emitter.from_verdict, self.h.emitter.to_verdict = "NOT_DUE", "DUE"
+        self.h.emitter.baseline_emits = True
+
+    def test_a_short_age_fires_once_when_it_lapses(self):
+        self.assertEqual(self.h.run([due("claim", "NOT_DUE")]), [])
+        self.assertEqual(self.h.run([due("claim", "DUE", "due-1")]), ["due-1"])
+        self.assertEqual(self.h.run([due("claim", "DUE", "due-1")]), [], "one due event per expiry")
+
+    def test_already_overdue_at_first_sight_is_an_event(self):
+        self.assertEqual(self.h.run([due("claim", "DUE", "due-1")]), ["due-1"])
+        payload = json.loads(self.h.conn.execute("SELECT payload FROM outbox").fetchone()[0])
+        self.assertEqual((payload["event"], payload["recipient"]), ("due", "keeper"))
+
+    def test_reverification_resets_the_clock_and_a_later_lapse_is_a_new_event(self):
+        self.h.run([due("claim", "NOT_DUE")])
+        self.h.run([due("claim", "DUE", "due-1")])
+        self.assertEqual(self.h.run([due("claim", "NOT_DUE")]), [], "re-verified: no event")
+        self.assertEqual(self.h.run([due("claim", "DUE", "due-2")]), ["due-2"])
+
+    def test_control_an_entity_that_never_lapses_never_fires(self):
+        for _ in range(3):
+            self.assertEqual(self.h.run([due("claim", "NOT_DUE")]), [])
+        self.assertEqual(self.h.outbox(), [])
+
+    def test_the_blocked_vocabulary_is_refused_for_a_due_emitter(self):
+        with self.assertRaises(em.ProtocolError):
+            self.h.run([due("claim", "BLOCKED")])
+
+
+class Retransition(unittest.TestCase):
+    def test_same_verdict_with_a_new_event_id_is_a_new_event(self):
+        # Re-blocked and unblocked again between two runs: the verdict reads
+        # UNBLOCKED both times, only the adapter's id shows the second transition.
+        h = Harness()
+        h.run([rec("a", "BLOCKED")])
+        h.run([rec("a", "UNBLOCKED", "id-a1")])
+        self.assertEqual(h.run([rec("a", "UNBLOCKED", "id-a2")]), ["id-a2"])
+        self.assertEqual(h.run([rec("a", "UNBLOCKED", "id-a2")]), [])
+
+    def test_an_old_state_file_is_migrated_not_refused(self):
+        h = Harness()
+        h.conn.close()
+        h.db.unlink()
+        old = sqlite3.connect(str(h.db))
+        old.executescript(em.SCHEMA.replace("    last_event TEXT,\n", ""))
+        old.execute("INSERT INTO verdicts (emitter, item, verdict, generation, tracked, updated)"
+                    " VALUES ('unblocked', 'a', 'BLOCKED', 0, 1, 0)")
+        old.commit()
+        old.close()
+        h.conn = em.connect(h.db)
+        self.assertEqual(h.run([rec("a", "UNBLOCKED", "id-a1")]), ["id-a1"])

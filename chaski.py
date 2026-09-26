@@ -310,7 +310,11 @@ def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
             raise RuleError(f"emitter {d['label']}: sink must be {{jsonl: <path>}}")
         e = emitter.Emitter(label=d["label"], command=list(d["command"]),
                             interval_s=parse_duration(d["schedule"]), owner=d["owner"],
-                            event=d.get("event", "unblocked"), timeout_s=int(d.get("timeout_s", 300)))
+                            event=d.get("event", "unblocked"), timeout_s=int(d.get("timeout_s", 300)),
+                            key=d.get("key", "item"),
+                            from_verdict=d.get("from", emitter.BLOCKED),
+                            to_verdict=d.get("to", emitter.UNBLOCKED),
+                            baseline_emits=bool(d.get("baseline_emits", False)))
         out.append((e, d["sink"]))
     return out
 
