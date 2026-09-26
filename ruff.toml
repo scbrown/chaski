@@ -1,0 +1,6 @@
+# Pinned here so CI and every checkout lint the same way, whatever ruff
+# configuration a contributor's machine carries.
+line-length = 120
+
+[lint]
+select = ["E", "F", "W"]
