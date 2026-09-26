@@ -308,8 +308,14 @@ def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
         missing = [f for f in ("label", "command", "schedule", "owner", "sink") if not d.get(f)]
         if missing:
             raise RuleError(f"emitter {d.get('label', '?')!r} is missing {missing}")
-        if set(d["sink"]) != {"jsonl"}:
-            raise RuleError(f"emitter {d['label']}: sink must be {{jsonl: <path>}}")
+        kinds = set(d["sink"])
+        if kinds not in ({"jsonl"}, {"graph"}):
+            raise RuleError(f"emitter {d['label']}: sink must be {{jsonl: <path>}} or {{graph: {{...}}}}")
+        if "graph" in kinds:
+            g = d["sink"]["graph"]
+            need = [f for f in ("severity", "action", "condition", "comment") if not g.get(f)]
+            if need:
+                raise RuleError(f"emitter {d['label']}: graph sink needs the Reaction fields {need}")
         e = emitter.Emitter(label=d["label"], command=list(d["command"]),
                             interval_s=parse_duration(d["schedule"]), owner=d["owner"],
                             event=d.get("event", "unblocked"), timeout_s=int(d.get("timeout_s", 300)),
@@ -319,6 +325,25 @@ def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
                             baseline_emits=bool(d.get("baseline_emits", False)))
         out.append((e, d["sink"]))
     return out
+
+
+def make_sink(e: emitter.Emitter, sink: dict, quipu_url: str):
+    """The receiver for one emitter's events. The graph sink writes, so it is
+    the one place chaski needs a quipu write credential: read from a file,
+    never from the rules or the command line."""
+    import emitter as em
+
+    if "jsonl" in sink:
+        return em.JsonlSink(sink["jsonl"])
+    import graph_sink
+
+    g = sink["graph"]
+    token_file = g.get("token_file")
+    token = Path(token_file).read_text().strip() if token_file else None
+    reaction = {"label": e.label, "schedule": f"PT{e.interval_s}S", "owner": e.owner,
+                "severity": g["severity"], "action": list(g["action"]),
+                "condition": g["condition"], "comment": g["comment"]}
+    return graph_sink.QuipuFiringSink(quipu_url, token, reaction)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -344,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
 
         conn = emitter.connect(args.emitter_db or args.state.with_name("emitter.db"))
         budget = emitter.WriteBudget(args.emitter_write_interval)  # ONE, shared by all
-        reactor.runners = [emitter.Runner(e, conn, emitter.JsonlSink(sink["jsonl"]), budget)
+        reactor.runners = [emitter.Runner(e, conn, make_sink(e, sink, args.quipu), budget)
                            for e, sink in load_emitters(args.emitters)]
     LOG.info("chaski: %d rule(s), event poll %ds", len(rules), reactor.event_poll_s)
     if args.once:
