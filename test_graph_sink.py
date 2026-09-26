@@ -147,6 +147,36 @@ class ThroughTheEmitter(unittest.TestCase):
         q.server.shutdown()
 
 
+class Load(unittest.TestCase):
+    def test_the_sink_sends_its_own_client_label(self):
+        self.assertEqual(gs.CLIENT_LABEL, "chaski-emitter")
+
+    def test_a_backlog_drains_at_most_deliver_per_tick_per_tick(self):
+        d = Path(tempfile.mkdtemp())
+        out = d / "adapter.json"
+        e = em.Emitter(label="x", owner="o", interval_s=10**9,
+                       command=[sys.executable, "-c", "import sys; print(open(sys.argv[1]).read())", str(out)])
+        conn = em.connect(d / "state.db")
+        items = [f"i{n}" for n in range(12)]
+        out.write_text(json.dumps([{"item": i, "verdict": "BLOCKED"} for i in items]))
+        em.observe(conn, e, em.run_adapter(e), 1.0)
+        out.write_text(json.dumps([{"item": i, "verdict": "UNBLOCKED", "event_id": f"id-{i}"} for i in items]))
+        em.observe(conn, e, em.run_adapter(e), 2.0)
+        sent = []
+
+        class Count:
+            def deliver(self, event):
+                sent.append(event["event_id"])
+
+        r = em.Runner(e, conn, Count())
+        r.last_attempt = 3.0  # no adapter run on these ticks: delivery only
+        for now in (4.0, 9.0, 14.0):
+            before = len(sent)
+            r.tick(now)
+            self.assertLessEqual(len(sent) - before, em.DELIVER_PER_TICK)
+        self.assertEqual(len(sent), 12)
+
+
 class Wiring(unittest.TestCase):
     def test_a_graph_sink_is_built_from_config_with_its_token_from_a_file(self):
         import chaski

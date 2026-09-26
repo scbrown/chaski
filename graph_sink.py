@@ -28,7 +28,9 @@ import urllib.request
 
 NS = "http://aegis.gastown.local/ontology/"
 USER_AGENT = "chaski/0.2"
-CLIENT_LABEL = "chaski"
+# A caller KIND of its own, so the emitter's writes are separable from chaski's
+# rule reads in quipu's per-caller accounting.
+CLIENT_LABEL = "chaski-emitter"
 
 
 def firing_iri(label: str, event_id: str, ns: str = NS) -> str:

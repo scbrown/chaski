@@ -52,6 +52,10 @@ LOG = logging.getLogger("chaski.emitter")
 BLOCKED, UNBLOCKED, UNKNOWN = "BLOCKED", "UNBLOCKED", "UNKNOWN"
 MAX_BACKOFF_S = 3600
 BASE_BACKOFF_S = 30
+# Deliveries per tick. The reactor ticks every 5 s, so this bounds a backlog
+# drain at 1 write/s: quipu applies writes one at a time, and a new writer
+# arriving in a burst has wedged it before.
+DELIVER_PER_TICK = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS verdicts (
@@ -309,7 +313,7 @@ class Runner:
             except Exception as exc:  # noqa: BLE001 — a failed run is UNKNOWN for every item
                 self.runs["unknown"] += 1
                 LOG.warning("emitter %s UNKNOWN (no verdict changed): %s", self.emitter.label, exc)
-        deliver_pending(self.conn, self.sink, now)
+        deliver_pending(self.conn, self.sink, now, limit=DELIVER_PER_TICK)
 
     def metrics(self, esc) -> list[str]:
         label = esc(self.emitter.label)
