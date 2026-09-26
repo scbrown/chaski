@@ -20,6 +20,11 @@ here, in one SQLite file:
   item's generation, so a later genuine re-block and unblock is a new event.
 - An item missing from a complete run is UNTRACKED (closed, or no blockers
   left), never unblocked. If it comes back, that is a new baseline.
+  KNOWN LIMIT (sattler, review of 88842e53): a transition that happens WHILE
+  an item is absent emits nothing on its return, because the return is a
+  baseline. An emitter whose consumers must hear such a return sets
+  baseline_emits (the review-age emitter does); the blocked-by one does not,
+  because "we did not watch it unblock" is the truthful reading there.
 - A failed run (non-zero exit, timeout, unparseable output) is UNKNOWN for
   every item: nothing changes.
 
