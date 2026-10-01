@@ -27,6 +27,11 @@ import json
 import urllib.request
 
 NS = "http://aegis.gastown.local/ontology/"
+# The quechua twin of the TERMS this sink reads (aegis-9dpcta). Only terms move:
+# firing, reaction and focus IRIs stay under NS, because instance identity does
+# not change in the transition. The served quipu does not honour
+# owl:equivalentClass on reads, so the read-back names both term IRIs itself.
+QUECHUA_NS = "https://scbrown.github.io/quechua/ns#"
 USER_AGENT = "chaski/0.2"
 # A caller KIND of its own, so the emitter's writes are separable from chaski's
 # rule reads in quipu's per-caller accounting.
@@ -101,7 +106,12 @@ class QuipuFiringSink:
 
     def _received(self, event: dict) -> bool:
         iri = firing_iri(self.reaction["label"], event["event_id"], self.ns)
-        out = self._post("/query", {"query": f"SELECT ?e WHERE {{ <{iri}> <{self.ns}eventId> ?e }}"})
+        # Legacy OR quechua eventId, as a UNION of two single bound patterns (one
+        # request). Not a (p1|p2) path: the served quipu drops literal objects
+        # there (aegis-sxlptn), and eventId is a literal.
+        q = (f"SELECT ?e WHERE {{ {{ <{iri}> <{self.ns}eventId> ?e }} UNION "
+             f"{{ <{iri}> <{QUECHUA_NS}eventId> ?e }} }}")
+        out = self._post("/query", {"query": q})
         rows = out.get("rows")
         if rows is None:
             raise ConnectionError(f"read-back returned no rows field: {str(out)[:200]}")

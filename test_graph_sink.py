@@ -24,6 +24,8 @@ class FakeQuipu:
         self.snapshots: dict[str, str] = {}
         self.knots = 0
         self.mode = "ok"  # ok | empty | refuse | lose-after-write
+        self.queries: list[str] = []
+        self.extra: list[str] = []  # facts written by someone else (another vocabulary)
         fake = self
 
         class H(BaseHTTPRequestHandler):
@@ -46,13 +48,17 @@ class FakeQuipu:
                         return self._send(200, None)  # landed, but the answer was lost
                     return self._send(200, {"conforms": True, "tx_id": fake.knots})
                 if self.path == "/query":
-                    subj = re.search(r"<([^>]+)> <[^>]+eventId>", body["query"]).group(1)
+                    fake.queries.append(body["query"])
+                    pats = re.findall(r"<([^>]+)> <([^>]+eventId)> \?e", body["query"])
                     rows = []
                     if fake.mode != "lose-after-write":
-                        for ttl in fake.snapshots.values():
-                            if ttl.startswith(f"<{subj}>"):
-                                m = re.search(r"eventId> (\"[^\"]*\")", ttl)
-                                rows.append({"e": json.loads(m.group(1))})
+                        for ttl in list(fake.snapshots.values()) + fake.extra:
+                            for subj, pred in pats:
+                                if not ttl.startswith(f"<{subj}>"):
+                                    continue
+                                m = re.search("<" + re.escape(pred) + r"> (\"[^\"]*\")", ttl)
+                                if m:
+                                    rows.append({"e": json.loads(m.group(1))})
                     return self._send(200, {"rows": rows})
                 self._send(404, {"error": self.path})
 
@@ -227,3 +233,43 @@ class Wiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuechuaDualRead(unittest.TestCase):
+    """aegis-9dpcta: the read-back accepts eventId under the legacy AND the
+    quechua term IRI. Instance IRIs (the firing) do not move."""
+
+    def setUp(self):
+        self.q = FakeQuipu()
+        self.sink = gs.QuipuFiringSink(self.q.url, "t", REACTION, timeout=5)
+        self.firing = gs.firing_iri(REACTION["label"], EVENT["event_id"])
+
+    def tearDown(self):
+        self.q.server.shutdown()
+
+    def fact(self, term_ns):
+        self.q.extra.append(f'<{self.firing}> <{term_ns}eventId> "{EVENT["event_id"]}" .\n')
+
+    def test_an_event_id_under_either_term_iri_is_received(self):
+        for ns in (gs.NS, gs.QUECHUA_NS):
+            with self.subTest(ns=ns):
+                self.q.extra.clear()
+                self.fact(ns)
+                self.assertTrue(self.sink._received(EVENT))
+
+    def test_controls_absent_and_foreign_namespace_are_not_received(self):
+        self.assertFalse(self.sink._received(EVENT))
+        self.fact("http://example.org/other#")
+        self.assertFalse(self.sink._received(EVENT))
+
+    def test_the_read_back_is_one_request_a_union_and_no_join(self):
+        self.fact(gs.QUECHUA_NS)
+        self.sink._received(EVENT)
+        [query] = self.q.queries
+        self.assertIn(" UNION ", query)
+        self.assertNotIn(" . ", query)
+        self.assertIn(f"<{gs.QUECHUA_NS}eventId>", query)
+
+    def test_instance_identity_stays_under_the_legacy_namespace(self):
+        self.assertTrue(self.firing.startswith(gs.NS + "firing-"))
+        self.assertIn(f"<{gs.NS}eventId>", self.sink.firing_turtle(EVENT))  # writers unchanged
