@@ -82,7 +82,7 @@ Every response includes `version: 1`. The first discovery starts after a durable
 feed-tail checkpoint; subsequent changes cannot fall through the bootstrap gap.
 Chaski polls `/changes` with `old_and_new_values` at the existing 60-second floor,
 committing the cursor and matching inbox records together. Routing atomically
-moves inbox records into a persistent key queue. Five changed subjects and five
+moves inbox records into a persistent key queue. Two changed subjects and two
 ready keys are processed per tick, with changed keys ahead of reconciliation.
 Verdicts, future deadlines and transition outbox records commit together. A
 failed operation leaves its work for retry, and restart does not repeat discovery.
