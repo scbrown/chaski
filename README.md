@@ -60,3 +60,42 @@ emitters:
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+### Incremental verdict adapters
+
+An emitter can set `trigger: changes` and `schedule: PT24H`. The schedule then
+means catalogue reconciliation, not a full verdict scan. The adapter must support
+`--describe` (local subscription metadata) and `--changes` (JSON on stdin). Existing
+scheduled adapters remain supported.
+
+The version-1 protocol describes `attributes`, `types` and trusted `graphs`.
+A request contains `now` plus one of:
+
+- `discover: true`: return `items`, the complete catalogue of candidate keys.
+- `route: [...]`: return `items` affected by the supplied fact changes. Retracted
+  links carry `old_value`; adapters must include their former owners.
+- `items: [...]`: return `scope`, `records` and `next_checks` (one future Unix
+  deadline or null per record). Missing keys inside scope become untracked;
+  keys outside scope retain their verdict. UNKNOWN preserves the last verdict.
+
+Every response includes `version: 1`. The first discovery starts after a durable
+feed-tail checkpoint; subsequent changes cannot fall through the bootstrap gap.
+Chaski polls `/changes` with `old_and_new_values` at the existing 60-second floor,
+committing the cursor and matching inbox records together. Routing atomically
+moves inbox records into a persistent key queue. Five changed subjects and five
+ready keys are processed per tick, with changed keys ahead of reconciliation.
+Verdicts, future deadlines and transition outbox records commit together. A
+failed operation leaves its work for retry, and restart does not repeat discovery.
+The existing idempotent receiver and global write budget still govern delivery.
+
+`chaski_changes_lag_transactions`, `chaski_changes_errors_total` and per-emitter
+`changes_pending`, `deadlines`, `next_due_timestamp_seconds` expose feed and queue
+health. The existing event lag/error signals also include the change feed. Idle
+adapters make no queries until a matching change, deadline or reconciliation.
+Catch-up is bounded to ten pages of 100 transactions per poll; sustained overload
+is visible as lag rather than silently dropping work. Latency includes queueing
+and adapter runtime; a large dependency fan-out can take multiple ticks.
+
+Adapter state uses additive SQLite tables in the existing emitter database.
+Rollback to a scheduled adapter preserves verdicts and delivered-event identities;
+keep that database, and restore the previous code and emitter configuration.

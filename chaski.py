@@ -163,6 +163,7 @@ class Reactor:
         self.event_errors = 0
         self.last_event_poll = 0.0
         self.lock = threading.Lock()
+        self.change_feed = None
         self.runners: list = []  # stage 2 emitters, attached by main()
 
     def _load_cursor(self) -> int:
@@ -222,18 +223,23 @@ class Reactor:
                 if r.triggerKind == "event" and seen & set(r.eventTypes.split(","))}
 
     def tick(self, now: float) -> None:
+        poll_changes = False
         with self.lock:
             due = {r.label for r in self.rules if r.triggerKind == "schedule"
                    and now - self.states[r.label].last_attempt >= r.interval_s}
             if now - self.last_event_poll >= self.event_poll_s:
                 due |= self.poll_events(now)
+                poll_changes = self.change_feed is not None
             for rule in self.rules:
                 if rule.label in due:
                     self.evaluate(rule, now)
+        if poll_changes:
+            self.change_feed.poll()
         # OUTSIDE the lock: an adapter run takes minutes, and metrics() takes
         # this lock. Runners publish their own snapshots for the scrape.
         for runner in self.runners:
-            runner.tick(now)
+            if not runner.emitter.change_driven or (self.change_feed and self.change_feed.ready):
+                runner.tick(now)
 
     def metrics(self) -> str:
         with self.lock:
@@ -259,10 +265,15 @@ class Reactor:
             lines += ["# TYPE chaski_transitions_total counter"]
             for r in self.rules:
                 lines.append(f'chaski_transitions_total{{rule="{_esc(r.label)}"}} {self.states[r.label].transitions}')
+            feed_lag = max(self.event_lag, self.change_feed.lag if self.change_feed else -1)
+            feed_errors = self.event_errors + (self.change_feed.errors if self.change_feed else 0)
             lines += ["# HELP chaski_events_lag Events behind the feed head at the last poll; -1 = not yet known.",
-                      "# TYPE chaski_events_lag gauge", f"chaski_events_lag {self.event_lag}",
+                      "# TYPE chaski_events_lag gauge", f"chaski_events_lag {feed_lag}",
                       "# TYPE chaski_event_poll_errors_total counter",
-                      f"chaski_event_poll_errors_total {self.event_errors}"]
+                      f"chaski_event_poll_errors_total {feed_errors}"]
+            if self.change_feed is not None:
+                lines += [f"chaski_changes_lag_transactions {self.change_feed.lag}",
+                          f"chaski_changes_errors_total {self.change_feed.errors}"]
             if self.runners:
                 lines += ["# HELP chaski_emitter_outbox_pending Events queued and not yet received.",
                           "# TYPE chaski_emitter_outbox_pending gauge"]
@@ -322,7 +333,10 @@ def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
                             key=d.get("key", "item"),
                             from_verdict=d.get("from", emitter.BLOCKED),
                             to_verdict=d.get("to", emitter.UNBLOCKED),
-                            baseline_emits=bool(d.get("baseline_emits", False)))
+                            baseline_emits=bool(d.get("baseline_emits", False)),
+                            change_driven=d.get("trigger", "schedule") == "changes")
+        if d.get("trigger", "schedule") not in {"schedule", "changes"}:
+            raise RuleError("emitter trigger must be schedule or changes")
         out.append((e, d["sink"]))
     return out
 
@@ -369,8 +383,13 @@ def main(argv: list[str] | None = None) -> int:
 
         conn = emitter.connect(args.emitter_db or args.state.with_name("emitter.db"))
         budget = emitter.WriteBudget(args.emitter_write_interval)  # ONE, shared by all
-        reactor.runners = [emitter.Runner(e, conn, make_sink(e, sink, args.quipu), budget)
-                           for e, sink in load_emitters(args.emitters)]
+        from incremental import ChangeFeed, ChangeRunner
+
+        reactor.runners = [(ChangeRunner if e.change_driven else emitter.Runner)(
+            e, conn, make_sink(e, sink, args.quipu), budget) for e, sink in load_emitters(args.emitters)]
+        changing = [r for r in reactor.runners if r.emitter.change_driven]
+        if changing:
+            reactor.change_feed = ChangeFeed(reactor.quipu, changing)
     LOG.info("chaski: %d rule(s), event poll %ds", len(rules), reactor.event_poll_s)
     if args.once:
         now = time.time()

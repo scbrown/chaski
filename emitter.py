@@ -116,6 +116,7 @@ class Emitter:
     from_verdict: str = BLOCKED
     to_verdict: str = UNBLOCKED
     baseline_emits: bool = False
+    change_driven: bool = False
 
     @property
     def verdicts(self) -> set[str]:
@@ -161,13 +162,19 @@ def _validate(emitter: Emitter, records: list[dict]) -> None:
         seen.add(item)
 
 
-def observe(conn: sqlite3.Connection, emitter: Emitter, records: list[dict], now: float) -> list[str]:
-    """Apply one COMPLETE adapter run. Returns the event ids newly queued.
+def observe(conn: sqlite3.Connection, emitter: Emitter, records: list[dict], now: float,
+            scope: set[str] | None = None) -> list[str]:
+    """Apply an adapter run; scope=None is complete, a set bounds a partial run.
+
+    Returns the event ids newly queued. Savepoints compose with an outer queue
+    transaction so acknowledgement cannot get ahead of the verdict update.
 
     All-or-nothing: a protocol error leaves every verdict and the outbox as
     they were.
     """
     _validate(emitter, records)
+    if scope is not None and any(r[emitter.key] not in scope for r in records):
+        raise ProtocolError("adapter record outside its partial scope")
     queued: list[str] = []
 
     def emit(r: dict, item: str, generation: int) -> None:
@@ -188,7 +195,7 @@ def observe(conn: sqlite3.Connection, emitter: Emitter, records: list[dict], now
         if cur.rowcount:
             queued.append(r["event_id"])
 
-    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("SAVEPOINT observation")
     try:
         present = set()
         for r in records:
@@ -235,12 +242,13 @@ def observe(conn: sqlite3.Connection, emitter: Emitter, records: list[dict], now
                 emit(r, item, generation)
         for (item,) in conn.execute(
                 "SELECT item FROM verdicts WHERE emitter=? AND tracked=1", (emitter.label,)).fetchall():
-            if item not in present:
+            if item not in present and (scope is None or item in scope):
                 conn.execute("UPDATE verdicts SET tracked=0, updated=? WHERE emitter=? AND item=?",
                              (now, emitter.label, item))
-        conn.execute("COMMIT")
+        conn.execute("RELEASE observation")
     except BaseException:
-        conn.execute("ROLLBACK")
+        conn.execute("ROLLBACK TO observation")
+        conn.execute("RELEASE observation")
         raise
     return queued
 
