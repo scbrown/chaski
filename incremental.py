@@ -17,7 +17,7 @@ from emitter import DELIVER_PER_TICK, ProtocolError, Runner, deliver_pending, ob
 
 LOG = logging.getLogger("chaski.changes")
 TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-BATCH = 5
+BATCH = 2
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS change_cursor (id INTEGER PRIMARY KEY CHECK(id=1), tx INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS change_inbox (
