@@ -371,7 +371,8 @@ def make_sink(e: emitter.Emitter, sink: dict, quipu_url: str):
     a = sink["alertmanager"]
     pw_file = a.get("password_file")
     password = Path(pw_file).read_text().strip() if pw_file else None
-    am = alertmanager_sink.AlertmanagerSink(a["url"], a, e.label, user=a.get("user"), password=password)
+    am = alertmanager_sink.AlertmanagerSink(a["url"], a, e.label, user=a.get("user"), password=password,
+                                            owner=e.owner)
     # graph first: a person is told about a firing the graph already holds
     return alertmanager_sink.ChainSink([graph, am])
 

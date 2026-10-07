@@ -48,8 +48,11 @@ class AlertmanagerSink:
 
     def __init__(self, base: str, alert: dict, emitter_label: str,
                  user: str | None = None, password: str | None = None,
-                 timeout: float = 15.0, clock=None):
+                 timeout: float = 15.0, clock=None, owner: str | None = None):
         self.base, self.alert, self.emitter_label = base.rstrip("/"), alert, emitter_label
+        # An event without a usable recipient goes to the emitter's owner, so it
+        # starts at a person who can act rather than at the admin tier.
+        self.owner = owner
         self.ttl_s = int(alert.get("ttl_s", DEFAULT_TTL_S))
         self.timeout = timeout
         self._auth = None
@@ -75,9 +78,10 @@ class AlertmanagerSink:
             "event_id": event["event_id"],
             "item": event["item"],
         })
-        recipient = event.get("recipient")
-        if recipient and _NAME.match(str(recipient)):
-            labels["keeper"] = str(recipient)
+        for who in (event.get("recipient"), self.owner):
+            if who and _NAME.match(str(who)):
+                labels["keeper"] = str(who)
+                break
         return labels
 
     def payload(self, event: dict) -> dict:

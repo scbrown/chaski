@@ -104,6 +104,12 @@ class Delivery(unittest.TestCase):
         p = self.sink.payload({**EVENT, "recipient": None})
         self.assertNotIn("keeper", p["labels"])
 
+    def test_without_a_usable_recipient_the_emitter_owner_is_keeper(self):
+        s = am.AlertmanagerSink(self.f.url, ALERT, "x", owner="owner-o")
+        self.assertEqual(s.payload({**EVENT, "recipient": None})["labels"]["keeper"], "owner-o")
+        self.assertEqual(s.payload({**EVENT, "recipient": "two words"})["labels"]["keeper"], "owner-o")
+        self.assertEqual(s.payload(EVENT)["labels"]["keeper"], "owner-a", "a real recipient still wins")
+
     def test_basic_auth_is_sent_when_configured(self):
         s = am.AlertmanagerSink(self.f.url, ALERT, "x", user="u", password="p")
         s.deliver(EVENT)
@@ -192,6 +198,7 @@ class Wiring(unittest.TestCase):
         self.assertIsInstance(built, am.ChainSink)
         self.assertIsInstance(built.sinks[0], gs.QuipuFiringSink)
         self.assertEqual(built.sinks[1]._auth, "Basic dTpw")
+        self.assertEqual(built.sinks[1].owner, "o")
 
     def test_alertmanager_alone_or_incomplete_is_refused(self):
         import chaski
