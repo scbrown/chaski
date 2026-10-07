@@ -320,9 +320,11 @@ def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
         if missing:
             raise RuleError(f"emitter {d.get('label', '?')!r} is missing {missing}")
         kinds = set(d["sink"])
-        if kinds not in ({"jsonl"}, {"graph"}, {"graph", "alertmanager"}):
+        if kinds != {"jsonl"} and not ("graph" in kinds and kinds <= {"graph", "command", "alertmanager"}):
             raise RuleError(f"emitter {d['label']}: sink must be {{jsonl: <path>}} or {{graph: {{...}}}},"
-                            " optionally with alertmanager: {...} beside graph")
+                            " optionally with command: {...} and/or alertmanager: {...} beside graph")
+        if "command" in kinds and not (d["sink"]["command"] or {}).get("argv"):
+            raise RuleError(f"emitter {d['label']}: command sink needs argv")
         if "alertmanager" in kinds:
             a = d["sink"]["alertmanager"]
             need = [f for f in ("url", "alertname", "severity") if not a.get(f)]
@@ -364,17 +366,26 @@ def make_sink(e: emitter.Emitter, sink: dict, quipu_url: str):
                 "severity": g["severity"], "action": list(g["action"]),
                 "condition": g["condition"], "comment": g["comment"]}
     graph = graph_sink.QuipuFiringSink(quipu_url, token, reaction)
-    if "alertmanager" not in sink:
+    if not {"command", "alertmanager"} & set(sink):
         return graph
     import alertmanager_sink
+
+    # Order: graph (the firing exists), then the command (the domain work), then
+    # Alertmanager (a person is told). Every member is idempotent on the event id.
+    chain = [graph]
+    if "command" in sink:
+        import command_sink
+        c = sink["command"]
+        chain.append(command_sink.CommandSink(c["argv"], float(c.get("timeout_s", 120))))
+    if "alertmanager" not in sink:
+        return alertmanager_sink.ChainSink(chain)
 
     a = sink["alertmanager"]
     pw_file = a.get("password_file")
     password = Path(pw_file).read_text().strip() if pw_file else None
     am = alertmanager_sink.AlertmanagerSink(a["url"], a, e.label, user=a.get("user"), password=password,
                                             owner=e.owner)
-    # graph first: a person is told about a firing the graph already holds
-    return alertmanager_sink.ChainSink([graph, am])
+    return alertmanager_sink.ChainSink([*chain, am])
 
 
 def main(argv: list[str] | None = None) -> int:
