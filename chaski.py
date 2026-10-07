@@ -320,8 +320,14 @@ def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
         if missing:
             raise RuleError(f"emitter {d.get('label', '?')!r} is missing {missing}")
         kinds = set(d["sink"])
-        if kinds not in ({"jsonl"}, {"graph"}):
-            raise RuleError(f"emitter {d['label']}: sink must be {{jsonl: <path>}} or {{graph: {{...}}}}")
+        if kinds not in ({"jsonl"}, {"graph"}, {"graph", "alertmanager"}):
+            raise RuleError(f"emitter {d['label']}: sink must be {{jsonl: <path>}} or {{graph: {{...}}}},"
+                            " optionally with alertmanager: {...} beside graph")
+        if "alertmanager" in kinds:
+            a = d["sink"]["alertmanager"]
+            need = [f for f in ("url", "alertname", "severity") if not a.get(f)]
+            if need:
+                raise RuleError(f"emitter {d['label']}: alertmanager sink needs {need}")
         if "graph" in kinds:
             g = d["sink"]["graph"]
             need = [f for f in ("severity", "action", "condition", "comment") if not g.get(f)]
@@ -357,7 +363,17 @@ def make_sink(e: emitter.Emitter, sink: dict, quipu_url: str):
     reaction = {"label": e.label, "schedule": f"PT{e.interval_s}S", "owner": e.owner,
                 "severity": g["severity"], "action": list(g["action"]),
                 "condition": g["condition"], "comment": g["comment"]}
-    return graph_sink.QuipuFiringSink(quipu_url, token, reaction)
+    graph = graph_sink.QuipuFiringSink(quipu_url, token, reaction)
+    if "alertmanager" not in sink:
+        return graph
+    import alertmanager_sink
+
+    a = sink["alertmanager"]
+    pw_file = a.get("password_file")
+    password = Path(pw_file).read_text().strip() if pw_file else None
+    am = alertmanager_sink.AlertmanagerSink(a["url"], a, e.label, user=a.get("user"), password=password)
+    # graph first: a person is told about a firing the graph already holds
+    return alertmanager_sink.ChainSink([graph, am])
 
 
 def main(argv: list[str] | None = None) -> int:
