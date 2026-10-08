@@ -99,3 +99,52 @@ and adapter runtime; a large dependency fan-out can take multiple ticks.
 Adapter state uses additive SQLite tables in the existing emitter database.
 Rollback to a scheduled adapter preserves verdicts and delivered-event identities;
 keep that database, and restore the previous code and emitter configuration.
+
+### Explicit event jobs
+
+`event_jobs.py` provides a durable job queue for authenticated event sources.
+Unlike a verdict emitter, the first explicit event is queued immediately rather
+than treated as a baseline. The source calls `enqueue` and acknowledges upstream
+only after it receives the committed event ID. The source is responsible for
+authentication; this CLI does not expose a network listener.
+
+A trusted configuration maps event types to fixed receiver argument arrays. An
+event contains only `event_id`, `type`, and an object `payload`; event data goes
+to the receiver's stdin and never chooses an executable or shell command. The
+receiver returns `event_id`, `job`, and `outcome` (`complete`, `held`, `unknown`,
+or `failed`). Only the exact completion receipt acknowledges the job.
+
+```json
+{
+  "enabled": false,
+  "hold_file": "/var/lib/example/hold",
+  "jobs": {
+    "pin": {
+      "types": ["release.published"],
+      "command": ["/usr/local/bin/release-pin-receiver"],
+      "timeout": 120
+    }
+  }
+}
+```
+
+```sh
+python event_jobs.py enqueue --state jobs.db --config jobs.json < event.json
+python event_jobs.py run-once --state jobs.db --config jobs.json
+```
+
+Execution is disabled by default and additionally respects the explicit hold
+file. Queue reception still works while held, so a release is retained. An
+operator-reviewed long-lived event listener should call `run-once` when events
+arrive and resume pending deliveries after restart; a reconciliation timer may
+be a backstop but is not the primary source. No listener or timer is installed
+by these commands.
+
+One OS-held worker lock prevents concurrent delivery. A crash can occur after a
+receiver's external side effect but before its receipt commits, so receivers
+must make their operation idempotent under the event/job identity. Recovery
+replays the identical frozen envelope. Changed payload under an existing ID
+refuses; completed jobs remain completed on redelivery. Failure retains pending
+work with bounded backoff. Receiver timeouts kill the process group before
+another attempt, and receiver output is not echoed into logs. Installation
+receivers must check their hold again immediately before changing a host.
