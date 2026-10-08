@@ -99,3 +99,44 @@ and adapter runtime; a large dependency fan-out can take multiple ticks.
 Adapter state uses additive SQLite tables in the existing emitter database.
 Rollback to a scheduled adapter preserves verdicts and delivered-event identities;
 keep that database, and restore the previous code and emitter configuration.
+
+### Authenticated external event sources
+
+An authenticated webhook or local event source can queue an explicit event into
+Chaski's existing emitter outbox with `external_event.py`. Authentication belongs
+to that source; this local CLI exposes no network listener. Configure an external
+emitter with `baseline_emits: true` so the first published event is delivered:
+
+```yaml
+emitters:
+  - label: release-pin
+    trigger: external
+    schedule: PT24H # metadata only; no periodic verdict adapter is invoked
+    owner: kit
+    event: release.published
+    from: ABSENT
+    to: PUBLISHED
+    baseline_emits: true
+    sink: {jsonl: /var/lib/example/releases.jsonl}
+```
+
+```sh
+printf '%s\n' '{"event_id":"repo-kit-1","type":"release.published","payload":{"tag":"v1.2.3"}}' |
+  python external_event.py --emitters emitters.yaml --label release-pin --state emitter.db
+```
+
+Use the same emitter database and configuration as the running Chaski instance.
+The existing runner delivers pending events on its next tick without running a
+verdict adapter or scanning remote data. Existing graph, command, alert, retry,
+write-budget and receiver-deduplication contracts remain in force. A command
+receiver must return nonzero while held or on failed proof: exit zero is its
+receipt and acknowledges delivery.
+
+The receipt contains the original source ID only after a synchronous transaction
+proves the exact outbox payload. A lost receipt may be retried with identical
+bytes; restart and redelivery do not queue a second firing. Changed payload under
+an existing source ID refuses. The outbox ID and graph focus use a hash scoped to
+the emitter, so arbitrary source identifiers cannot become graph syntax and two
+emitters can consume the same source event independently. Graph reaction metadata
+records an event trigger for this mode. No webhook or installer is activated by
+adding the source code.

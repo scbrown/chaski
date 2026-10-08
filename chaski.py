@@ -316,7 +316,10 @@ def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
     doc = yaml.safe_load(path.read_text()) or {}
     out = []
     for d in doc.get("emitters", []):
-        missing = [f for f in ("label", "command", "schedule", "owner", "sink") if not d.get(f)]
+        required = ("label", "schedule", "owner", "sink")
+        if d.get("trigger", "schedule") != "external":
+            required += ("command",)
+        missing = [f for f in required if not d.get(f)]
         if missing:
             raise RuleError(f"emitter {d.get('label', '?')!r} is missing {missing}")
         kinds = set(d["sink"])
@@ -335,16 +338,19 @@ def load_emitters(path: Path) -> list[tuple[emitter.Emitter, dict]]:
             need = [f for f in ("severity", "action", "condition", "comment") if not g.get(f)]
             if need:
                 raise RuleError(f"emitter {d['label']}: graph sink needs the Reaction fields {need}")
-        e = emitter.Emitter(label=d["label"], command=list(d["command"]),
+        e = emitter.Emitter(label=d["label"], command=list(d.get("command", [])),
                             interval_s=parse_duration(d["schedule"]), owner=d["owner"],
                             event=d.get("event", "unblocked"), timeout_s=int(d.get("timeout_s", 300)),
                             key=d.get("key", "item"),
                             from_verdict=d.get("from", emitter.BLOCKED),
                             to_verdict=d.get("to", emitter.UNBLOCKED),
                             baseline_emits=bool(d.get("baseline_emits", False)),
-                            change_driven=d.get("trigger", "schedule") == "changes")
-        if d.get("trigger", "schedule") not in {"schedule", "changes"}:
-            raise RuleError("emitter trigger must be schedule or changes")
+                            change_driven=d.get("trigger", "schedule") == "changes",
+                            externally_triggered=d.get("trigger", "schedule") == "external")
+        if d.get("trigger", "schedule") not in {"schedule", "changes", "external"}:
+            raise RuleError("emitter trigger must be schedule, changes or external")
+        if e.externally_triggered and d.get("baseline_emits") is not True:
+            raise RuleError("external emitters require baseline_emits: true to retain their first event")
         out.append((e, d["sink"]))
     return out
 
@@ -365,6 +371,8 @@ def make_sink(e: emitter.Emitter, sink: dict, quipu_url: str):
     reaction = {"label": e.label, "schedule": f"PT{e.interval_s}S", "owner": e.owner,
                 "severity": g["severity"], "action": list(g["action"]),
                 "condition": g["condition"], "comment": g["comment"]}
+    if e.externally_triggered:
+        reaction.update(trigger_kind="event", event_types=e.event)
     graph = graph_sink.QuipuFiringSink(quipu_url, token, reaction)
     if not {"command", "alertmanager"} & set(sink):
         return graph

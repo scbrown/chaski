@@ -117,6 +117,7 @@ class Emitter:
     to_verdict: str = UNBLOCKED
     baseline_emits: bool = False
     change_driven: bool = False
+    externally_triggered: bool = False
 
     @property
     def verdicts(self) -> set[str]:
@@ -365,7 +366,7 @@ class Runner:
         self._publish()
 
     def tick(self, now: float) -> None:
-        if now - self.last_attempt >= self.emitter.interval_s:
+        if not self.emitter.externally_triggered and now - self.last_attempt >= self.emitter.interval_s:
             self.last_attempt = now
             try:
                 records = run_adapter(self.emitter)
