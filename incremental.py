@@ -7,6 +7,7 @@ so a daily reconciliation never monopolizes the reactor with a population scan.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -28,6 +29,8 @@ CREATE TABLE IF NOT EXISTS adapter_deadlines (
  PRIMARY KEY(emitter,item));
 CREATE TABLE IF NOT EXISTS adapter_reconcile (
  emitter TEXT PRIMARY KEY, last_success REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS adapter_subscription (
+ emitter TEXT PRIMARY KEY, digest TEXT NOT NULL);
 """
 
 
@@ -57,7 +60,27 @@ class ChangeRunner(Runner):
         self.graphs = strings(self.subscription.get("graphs"))
         self.types = strings(self.subscription.get("types", []))
         self.retry_at = 0.0
+        self._reconcile_on_new_subscription(conn, emitter.label)
         super().__init__(emitter, conn, sink, budget)
+
+    def _reconcile_on_new_subscription(self, conn, label):
+        """A changed subscription reconciles at once, not on the daily pass.
+
+        Changes to an attribute the OLD subscription did not include were
+        consumed while the old adapter ran and the cursor moved past them, so
+        nothing routes them again. Measured 2026-10-08 (aegis-z1epad): 68
+        WorkItems gained a newly subscribed attribute, 20 of them due, and
+        chaski saw none of them for most of a day. Forgetting the last
+        reconcile makes the next tick rediscover every candidate; the
+        verdict/outbox state keeps that idempotent. Also true on the first start
+        after this change, where no digest has been stored yet."""
+        digest = hashlib.sha256(json.dumps(self.subscription, sort_keys=True).encode()).hexdigest()
+        row = conn.execute("SELECT digest FROM adapter_subscription WHERE emitter=?", (label,)).fetchone()
+        if row and row[0] == digest:
+            return
+        conn.execute("DELETE FROM adapter_reconcile WHERE emitter=?", (label,))
+        conn.execute("INSERT OR REPLACE INTO adapter_subscription VALUES (?,?)", (label, digest))
+        conn.commit()
 
     def accepts(self, record):
         if record["graph"] not in self.graphs:

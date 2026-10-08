@@ -171,3 +171,26 @@ def test_factless_transactions_do_not_create_permanent_lag(setup):
     feed.poll()
     assert feed.lag == 0
     assert conn.execute("SELECT tx FROM change_cursor").fetchone()[0] == 12
+
+
+def test_a_changed_subscription_reconciles_at_once_and_an_unchanged_one_does_not(setup, monkeypatch):
+    """aegis-z1epad: an attribute added to the subscription was missed for most
+    of a day, because the old adapter consumed its changes."""
+    conn, e, runner, calls = setup
+    runner.tick(100)                                  # first reconcile, at t=100
+    calls.clear()
+    inc.ChangeRunner(e, conn, Sink()).tick(200)       # same subscription: no rediscovery
+    assert not any(c and c.get("discover") for c in calls)
+    real = inc.call
+
+    def widened(emitter, request=None):
+        if request is None:
+            return {"version": 1, "attributes": ["status", "idleLimit"], "graphs": ["ROOT"]}
+        return real(emitter, request)
+    monkeypatch.setattr(inc, "call", widened)
+    calls.clear()
+    inc.ChangeRunner(e, conn, Sink()).tick(300)       # widened: rediscover now, not at t=86500
+    assert any(c and c.get("discover") for c in calls)
+    calls.clear()
+    inc.ChangeRunner(e, conn, Sink()).tick(400)       # and only once
+    assert not any(c and c.get("discover") for c in calls)
