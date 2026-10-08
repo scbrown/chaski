@@ -106,10 +106,16 @@ class QuipuFiringSink:
     def reaction_turtle(self) -> str:
         r = self.reaction
         actions = ", ".join(_lit(a) for a in r["action"])
+        kind = r.get("trigger_kind", "schedule")
+        if kind not in {"schedule", "event"}:
+            raise ValueError("reaction trigger kind must be schedule or event")
+        event_types = (f"  <{self.ns}eventTypes> {_lit(r['event_types'])} ;\n"
+                       if kind == "event" else "")
         return (
             f"<{self.reaction_iri()}> a <{self.ns}Reaction> ;\n"
             f"  <http://www.w3.org/2000/01/rdf-schema#label> {_lit(r['label'])} ;\n"
-            f"  <{self.ns}triggerKind> \"schedule\" ; <{self.ns}schedule> {_lit(r['schedule'])} ;\n"
+            f"  <{self.ns}triggerKind> {_lit(kind)} ; <{self.ns}schedule> {_lit(r['schedule'])} ;\n"
+            f"{event_types}"
             f"  <{self.ns}condition> {_lit(r['condition'])} ;\n"
             f"  <{self.ns}severity> {_lit(r['severity'])} ; <{self.ns}action> {actions} ;\n"
             f"  <{self.ns}owner> {_lit(r['owner'])} ;\n"
