@@ -24,6 +24,9 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
+import re
+import socket
 import urllib.request
 
 NS = "http://aegis.gastown.local/ontology/"
@@ -36,6 +39,27 @@ USER_AGENT = "chaski/0.2"
 # A caller KIND of its own, so the emitter's writes are separable from chaski's
 # rule reads in quipu's per-caller accounting.
 CLIENT_LABEL = "chaski-emitter"
+
+
+_UNSAFE_HEADER = re.compile(r"[^\x21-\x7e ]")
+
+
+def provenance_headers(env=None) -> dict:
+    """Structured write provenance (aegis-7zp4rc): chaski is a service, so it
+    names itself (agent=chaski, harness=service, host); QUIPU_AGENT /
+    QUIPU_HARNESS / QUIPU_HOST override. No session or model: a service has
+    neither, and quipu's coverage metric does not expect them. Values are
+    single-line printable ASCII, capped at 128 characters."""
+    env = os.environ if env is None else env
+    raw = {"Agent": env.get("QUIPU_AGENT") or "chaski",
+           "Harness": env.get("QUIPU_HARNESS") or "service",
+           "Host": env.get("QUIPU_HOST") or socket.gethostname()}
+    out = {}
+    for field, value in raw.items():
+        text = _UNSAFE_HEADER.sub("", str(value)).strip()[:128]
+        if text:
+            out[f"X-Quipu-{field}"] = text
+    return out
 
 
 def firing_iri(label: str, event_id: str, ns: str = NS) -> str:
@@ -60,7 +84,7 @@ class QuipuFiringSink:
         req = urllib.request.Request(
             self.base + path, data=json.dumps(body).encode(), method="POST",
             headers={"Content-Type": "application/json", "User-Agent": USER_AGENT,
-                     "X-Quipu-Client": CLIENT_LABEL,
+                     "X-Quipu-Client": CLIENT_LABEL, **provenance_headers(),
                      **({"Authorization": f"Bearer {self.token}"} if self.token else {})})
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             raw = resp.read()

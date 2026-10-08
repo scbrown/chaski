@@ -273,3 +273,30 @@ class QuechuaDualRead(unittest.TestCase):
     def test_instance_identity_stays_under_the_legacy_namespace(self):
         self.assertTrue(self.firing.startswith(gs.NS + "firing-"))
         self.assertIn(f"<{gs.NS}eventId>", self.sink.firing_turtle(EVENT))  # writers unchanged
+
+
+class Provenance(unittest.TestCase):
+    """aegis-7zp4rc: chaski's quipu writes say who wrote them."""
+
+    def test_the_service_names_itself_and_overrides_win(self):
+        from unittest import mock
+        with mock.patch("socket.gethostname", return_value="automation"):
+            self.assertEqual(gs.provenance_headers({}), {"X-Quipu-Agent": "chaski",
+                                                         "X-Quipu-Harness": "service",
+                                                         "X-Quipu-Host": "automation"})
+        h = gs.provenance_headers({"QUIPU_AGENT": "x\r\nEvil: 1", "QUIPU_HOST": "h"})
+        self.assertEqual(h["X-Quipu-Agent"], "xEvil: 1")
+
+    def test_every_write_carries_them(self):
+        q = FakeQuipu()
+        seen = []
+        orig = q.server.RequestHandlerClass.do_POST
+
+        def spy(handler):
+            seen.append(handler.headers.get("X-Quipu-Agent"))
+            return orig(handler)
+        q.server.RequestHandlerClass.do_POST = spy
+        sink = gs.QuipuFiringSink(q.url, None, REACTION)
+        sink.deliver({"event_id": "e1", "item": "w1", "observed_at": 1.0})
+        q.server.shutdown()
+        self.assertTrue(seen and all(a == "chaski" for a in seen), seen)
