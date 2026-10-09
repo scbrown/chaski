@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import subprocess
 import threading
@@ -154,6 +155,10 @@ def _validate(emitter: Emitter, records: list[dict]) -> None:
         item = r[emitter.key]
         if r.get("verdict") not in emitter.verdicts:
             raise ProtocolError(f"{item}: verdict {r.get('verdict')!r} not in {sorted(emitter.verdicts)}")
+        kind = r.get("work_kind")
+        if kind is not None and (not isinstance(kind, str) or
+                                 not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,127}", kind)):
+            raise ProtocolError(f"{item}: invalid work_kind")
         if r["verdict"] == emitter.to_verdict and not r.get("event_id"):
             # Without a deterministic id the receiver cannot deduplicate, and a
             # send-time id would make at-least-once delivery at-least-twice.
@@ -186,6 +191,7 @@ def observe(conn: sqlite3.Connection, emitter: Emitter, records: list[dict], now
             # the owner of an aged entity
             "recipient": r.get("assignee") or r.get("owner"),
             "evidence": r.get("evidence"), "observed_at": now,
+            **({"work_kind": r["work_kind"]} if r.get("work_kind") else {}),
         }
         cur = conn.execute(
             "INSERT OR IGNORE INTO outbox (event_id, emitter, item, generation, payload, created)"

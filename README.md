@@ -140,3 +140,14 @@ the emitter, so arbitrary source identifiers cannot become graph syntax and two
 emitters can consume the same source event independently. Graph reaction metadata
 records an event trigger for this mode. No webhook or installer is activated by
 adding the source code.
+
+### Kind-specific review signals
+
+Verdict adapters may include a bounded `work_kind` token. The emitter freezes it
+in the outbox with the event identity, so a retry cannot reclassify an event.
+The Alertmanager sink accepts an optional `kind_overrides` map in deployment
+configuration. Each exact kind may override only `severity` and `alertname`;
+other labels and adapter-supplied severity are ignored. Missing and unknown kinds
+retain the emitter's default policy. For example, a deployment can route
+`DreamCycle` and `DreamLane` as informational signals while directives remain
+warnings. Changing this map is a routing-policy change requiring review.

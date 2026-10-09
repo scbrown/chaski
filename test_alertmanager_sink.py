@@ -62,6 +62,26 @@ class FakeAlertmanager:
 
 
 class Delivery(unittest.TestCase):
+    def test_bad_configured_policy_is_refused(self):
+        for overrides in ([], {"DreamCycle": {"keeper": "other"}},
+                          {"DreamCycle": {"severity": "silent"}},
+                          {"DreamCycle": {"alertname": "bad\nname"}}):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                am.AlertmanagerSink(self.f.url, {**ALERT, "kind_overrides": overrides}, "x")
+
+    def test_only_configured_kind_selects_info_and_retry_keeps_one_alert(self):
+        config = {**ALERT, "kind_overrides": {
+            "DreamCycle": {"severity": "info", "alertname": "DreamCycleReviewDue"}}}
+        sink = am.AlertmanagerSink(self.f.url, config, "entity-review-due")
+        dream = {**EVENT, "work_kind": "DreamCycle", "severity": "critical"}
+        sink.deliver(dream)
+        sink.deliver(dream)
+        (alert,) = self.f.alerts.values()
+        self.assertEqual(alert["labels"]["severity"], "info")
+        self.assertEqual(alert["labels"]["alertname"], "DreamCycleReviewDue")
+        for kind in (None, "Directive", "unknown"):
+            self.assertEqual(sink.labels({**EVENT, "work_kind": kind})["severity"], "warning")
+
     def setUp(self):
         self.f = FakeAlertmanager()
         self.sink = am.AlertmanagerSink(self.f.url, ALERT, "entity-review-due", clock=lambda: 5000.0)

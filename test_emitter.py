@@ -48,6 +48,23 @@ class Harness:
 
 
 class Transitions(unittest.TestCase):
+    def test_work_kind_is_frozen_in_outbox_and_replay_cannot_reclassify_it(self):
+        self.h.run([rec("a", "BLOCKED")])
+        record = {**rec("a", "UNBLOCKED", "id-a1"), "work_kind": "DreamCycle"}
+        self.h.run([record])
+        record["work_kind"] = "Directive"
+        self.h.run([record])
+        (raw,) = self.h.conn.execute("SELECT payload FROM outbox").fetchone()
+        self.assertEqual(json.loads(raw)["work_kind"], "DreamCycle")
+
+    def test_invalid_kind_refuses_all_records_before_any_outbox_write(self):
+        self.h.run([rec("a", "BLOCKED"), rec("b", "BLOCKED")])
+        for kind in (["DreamCycle"], "", "DreamCycle\ncritical", 7):
+            with self.subTest(kind=kind), self.assertRaises(em.ProtocolError):
+                self.h.run([rec("a", "UNBLOCKED", "id-a1"),
+                            {**rec("b", "UNBLOCKED", "id-b1"), "work_kind": kind}])
+            self.assertEqual(self.h.outbox(), [])
+
     def setUp(self):
         self.h = Harness()
 
