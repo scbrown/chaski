@@ -35,27 +35,41 @@ alert, so alerts resolve on their own.
 - **Emission reuses Prometheus and Alertmanager.** chaski exports metrics; it
   does not invent notification plumbing.
 
-## Status
+## Install and first event
 
-Stage 1: a read-only skeleton, with the event tail, schedule rules, metrics and
-the canary. No writes and no pages yet.
+Python 3.10 or newer is required. Download a reviewed wheel and its checksums
+from [GitHub releases](https://github.com/scbrown/chaski/releases), verify its
+SHA256, then install it with pip or pipx:
 
-Stage 2 (in progress): **emitters** (`emitter.py`). An emitter runs an external
-verdict adapter on a schedule and turns its answers into transition events. A
-first sighting is a baseline, "unknown" keeps the last verdict, and only a
-known blocked-to-unblocked transition emits. Verdict and outbox commit in one
-transaction. Delivery is at least once to a receiver that deduplicates on the
-adapter's deterministic event id. Configure with `--emitters emitters.yaml`:
-
-```yaml
-emitters:
-  - label: workitem-unblocked
-    command: [python3, /path/to/blocked_by.py]
-    schedule: PT15M
-    owner: someone
-    event: unblocked
-    sink: {jsonl: /var/lib/chaski/unblocked.jsonl}
+```sh
+pipx install ./chaski-0.1.0-py3-none-any.whl
+chaski --version
+chaski --help
+chaski events --directory ./proof
+chaski verify-event --directory ./proof --marker first-event
+chaski events --directory ./proof
 ```
+
+The reads return `[]` before and `["first-event"]` after. The proof runs the
+actual adapter, verdict/outbox transaction and JSONL receiver in a new scratch
+directory, including a receiver replay control. It never contacts a live graph
+or starts the service. Reusing a proof directory is refused.
+
+Run the reactor using explicit configuration and preserved state:
+
+```sh
+chaski --quipu http://localhost:3030 --rules rules.example.yaml --state state/cursor.json
+```
+
+The source includes durable emitters, graph/JSONL receivers, configured
+Alertmanager routing, and change-driven adapters. Sink writes are opt-in through
+configuration and share a global write budget. Runtime installation and graph
+admission are separate from a successful local event proof.
+
+Read the [installation book](docs/book/src/installing.md),
+[configuration](docs/book/src/configuration.md), and
+[operations](docs/book/src/operations.md). Contributors should read
+[AGENTS.md](AGENTS.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
