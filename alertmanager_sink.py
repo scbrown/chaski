@@ -50,6 +50,21 @@ class AlertmanagerSink:
                  user: str | None = None, password: str | None = None,
                  timeout: float = 15.0, clock=None, owner: str | None = None):
         self.base, self.alert, self.emitter_label = base.rstrip("/"), alert, emitter_label
+        # Only deployment configuration may choose routing/severity. An
+        # adapter's arbitrary extra fields cannot supply alert policy.
+        self.kind_overrides = alert.get("kind_overrides", {})
+        if not isinstance(self.kind_overrides, dict):
+            raise ValueError("kind_overrides must be a mapping")
+        for kind, policy in self.kind_overrides.items():
+            if not isinstance(kind, str) or not _NAME.fullmatch(kind):
+                raise ValueError("invalid override kind")
+            if not isinstance(policy, dict) or not policy or set(policy) - {"severity", "alertname"}:
+                raise ValueError("kind override permits only severity and alertname")
+            if "severity" in policy and policy["severity"] not in {"info", "warning", "critical"}:
+                raise ValueError("invalid override severity")
+            if "alertname" in policy and (not isinstance(policy["alertname"], str) or
+                                           not _NAME.fullmatch(policy["alertname"])):
+                raise ValueError("invalid override alertname")
         # An event without a usable recipient goes to the emitter's owner, so it
         # starts at a person who can act rather than at the admin tier.
         self.owner = owner
@@ -78,6 +93,9 @@ class AlertmanagerSink:
             "event_id": event["event_id"],
             "item": event["item"],
         })
+        kind = event.get("work_kind")
+        if isinstance(kind, str) and _NAME.fullmatch(kind):
+            labels.update(self.kind_overrides.get(kind, {}))
         for who in (event.get("recipient"), self.owner):
             if who and _NAME.match(str(who)):
                 labels["keeper"] = str(who)
