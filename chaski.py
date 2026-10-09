@@ -15,6 +15,7 @@ firing" silently resolves real alerts.
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 import logging
 import re
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import yaml
+
+from chaski_version import __version__
 
 if TYPE_CHECKING:
     import emitter
@@ -397,7 +400,12 @@ def make_sink(e: emitter.Emitter, sink: dict, quipu_url: str):
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in {"verify-event", "events"}:
+        from chaski_verify import main as verification_main
+        return verification_main(argv)
+    ap = argparse.ArgumentParser(description="The chaski CLI: durable reactions for Quipu knowledge graphs")
+    ap.add_argument("--version", action="version", version=f"chaski {__version__}")
     ap.add_argument("--quipu", required=True, help="quipu base URL")
     ap.add_argument("--rules", required=True, type=Path)
     ap.add_argument("--state", required=True, type=Path, help="event cursor file")
