@@ -164,6 +164,7 @@ class Reactor:
         self.last_event_poll = 0.0
         self.lock = threading.Lock()
         self.change_feed = None
+        self.change_stream = None
         self.runners: list = []  # stage 2 emitters, attached by main()
 
     def _load_cursor(self) -> int:
@@ -229,12 +230,14 @@ class Reactor:
                    and now - self.states[r.label].last_attempt >= r.interval_s}
             if now - self.last_event_poll >= self.event_poll_s:
                 due |= self.poll_events(now)
-                poll_changes = self.change_feed is not None
+                poll_changes = self.change_feed is not None and self.change_stream is None
             for rule in self.rules:
                 if rule.label in due:
                     self.evaluate(rule, now)
         if poll_changes:
             self.change_feed.poll()
+        if self.change_stream is not None:
+            self.change_stream.pump(self.change_feed)
         # OUTSIDE the lock: an adapter run takes minutes, and metrics() takes
         # this lock. Runners publish their own snapshots for the scrape.
         for runner in self.runners:
@@ -266,7 +269,8 @@ class Reactor:
             for r in self.rules:
                 lines.append(f'chaski_transitions_total{{rule="{_esc(r.label)}"}} {self.states[r.label].transitions}')
             feed_lag = max(self.event_lag, self.change_feed.lag if self.change_feed else -1)
-            feed_errors = self.event_errors + (self.change_feed.errors if self.change_feed else 0)
+            feed_errors = (self.event_errors + (self.change_feed.errors if self.change_feed else 0)
+                           + (self.change_stream.errors if self.change_stream else 0))
             lines += ["# HELP chaski_events_lag Events behind the feed head at the last poll; -1 = not yet known.",
                       "# TYPE chaski_events_lag gauge", f"chaski_events_lag {feed_lag}",
                       "# TYPE chaski_event_poll_errors_total counter",
@@ -409,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--emitter-db", type=Path, help="emitter state (default: beside --state)")
     ap.add_argument("--emitter-write-interval", type=float, default=5.0,
                     help="GLOBAL minimum seconds between sink writes, across all emitters")
+    ap.add_argument("--changes-stream", action="store_true",
+                    help="use committed transaction stream for incremental emitters")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -433,10 +439,20 @@ def main(argv: list[str] | None = None) -> int:
             reactor.evaluate(rule, now)
         print(reactor.metrics(), end="")
         return 0
+    if args.changes_stream and reactor.change_feed is not None:
+        from change_stream import ChangeStream
+        reactor.change_feed.poll()  # retain existing bootstrap-to-tail semantics
+        row = reactor.change_feed.conn.execute("SELECT tx FROM change_cursor WHERE id=1").fetchone()
+        if row is None:
+            raise RuntimeError("cannot start stream without a durable bootstrap cursor")
+        reactor.change_stream = ChangeStream(reactor.quipu, row[0])
     serve_metrics(reactor, args.metrics_port)
     while True:
         reactor.tick(time.time())
-        time.sleep(5)
+        if reactor.change_stream is not None:
+            reactor.change_stream.wait(5)
+        else:
+            time.sleep(5)
 
 
 if __name__ == "__main__":
