@@ -1,0 +1,5 @@
+Script started on 2026-10-10 13:36:08-04:00 [COMMAND="python3 docs/demos/committed-stream.py" <not executed on terminal>]
+Before delivery: cursor=0, relevant inbox=0; queue capacity=1
+{"probe": "bounded reactor turns, 12 irrelevant transactions before relevant target transaction", "pages_applied": 13, "relevant_deliveries": 1, "elapsed_seconds": 0.0501054780324921, "queue_capacity": 1, "reactor_turns": 1}
+
+Script done on 2026-10-10 13:36:08-04:00 [COMMAND_EXIT_CODE="0"]
