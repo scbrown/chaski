@@ -151,3 +151,25 @@ other labels and adapter-supplied severity are ignored. Missing and unknown kind
 retain the emitter's default policy. For example, a deployment can route
 `DreamCycle` and `DreamLane` as informational signals while directives remain
 warnings. Changing this map is a routing-policy change requiring review.
+
+
+### Committed transaction stream (opt-in)
+
+`--changes-stream` moves incremental emitter change delivery to the read-only
+`/changes/stream` SSE endpoint. Existing configurations keep the poll path.
+Bootstrap retains the existing tail-before-discovery behavior. Transaction IDs
+are local durable change cursors; they are not `/events/commit` event offsets.
+The reader queues one complete frame and waits for the reactor thread to commit
+both routed inbox records and the cursor before accepting another. The reactor drains up to64 pages in a50ms burst
+(budget checked between commits), then gives adapters/deadlines their turn.
+New delivery wakes the reactor instead of waiting for its five-second idle
+sleep; only one frame stays queued. Disconnects,
+invalid frames and failed local commits retain the last applied cursor and
+reconnect with 1–60 second backoff. A frame is bounded to 1 MiB; heartbeat
+comments perform no graph read. The network thread never accesses SQLite.
+
+Scheduled rules, incremental adapter deadlines and bounded catalogue
+reconciliation retain their existing behavior. This flag does not move the
+separate ROOT event-rule consumer to SSE. Closing a network reader can wait for
+its bounded 45-second socket timeout. Source tests are not permission to enable
+this flag, replay production history or claim natural scheduled acceptance.

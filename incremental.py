@@ -222,30 +222,49 @@ class ChangeFeed:
             since = row[0] if row else 9223372036854775807
             query = urllib.parse.urlencode({"since": since, "capture": "old_and_new_values", "limit": 100})
             out = self.quipu._request("GET", "/changes?" + query)
-            records, watermark, cursor = out["records"], out["watermark_tx"], out["next_tx"]
-            if not isinstance(records, list) or not isinstance(watermark, int) or not isinstance(cursor, int):
-                raise ProtocolError("invalid change page")
-            if row and (cursor < since or cursor > watermark):
-                raise ProtocolError("change cursor outside committed prefix")
-            cursor = cursor if row and records else watermark
-            deliveries = []
-            for r in records if row else []:
-                if not since < r["tx"] <= cursor or r["op"] not in {"assert", "retract", "tombstone"}:
-                    raise ProtocolError("invalid change record")
-                for runner in self.runners:
-                    if runner.accepts(r):
-                        deliveries.append((runner.emitter.label, r["tx"], r["sequence"], json.dumps(r)))
-            self.conn.execute("BEGIN IMMEDIATE")
-            try:
-                self.conn.executemany("INSERT OR IGNORE INTO change_inbox VALUES (?,?,?,?)", deliveries)
-                self.conn.execute("INSERT OR REPLACE INTO change_cursor VALUES (1,?)", (cursor,))
-                self.conn.execute("COMMIT")
-            except BaseException:
-                self.conn.execute("ROLLBACK")
-                raise
-            self.lag = watermark - cursor
-            self.ready = True
-            return row is not None and cursor > since and cursor < watermark
+            return self.accept_page(out, since)
         except Exception as exc:  # noqa: BLE001
             self.errors += 1
             LOG.warning("change feed UNKNOWN (cursor retained): %s", exc)
+
+    def accept_page(self, out, since, stream_id=None):
+        """Apply a delivered page atomically; delivery alone never advances the cursor.
+
+        Network readers pass pages to the SQLite owner thread. Stream identifiers
+        are transaction cursors, not offsets accepted by /events/commit.
+        """
+        row = self.conn.execute("SELECT tx FROM change_cursor WHERE id=1").fetchone()
+        if row is not None and row[0] != since:
+            raise ProtocolError("stale change delivery")
+        records, watermark, cursor = out["records"], out["watermark_tx"], out["next_tx"]
+        if not isinstance(records, list) or type(watermark) is not int or type(cursor) is not int:
+            raise ProtocolError("invalid change page")
+        if watermark < 0 or cursor < 0 or (row is not None and cursor > watermark):
+            raise ProtocolError("change cursor outside committed prefix")
+        if row and cursor < since:
+            raise ProtocolError("change cursor regressed")
+        if stream_id is not None and (row is None or type(stream_id) is not int
+                                      or stream_id != cursor or stream_id <= since):
+            raise ProtocolError("stream ID is not the durable transaction cursor")
+        cursor = cursor if row and (records or stream_id is not None) else watermark
+        deliveries = []
+        for r in records if row else []:
+            if (not isinstance(r, dict) or type(r.get("tx")) is not int
+                    or type(r.get("sequence")) is not int or r["sequence"] < 0
+                    or not since < r["tx"] <= cursor
+                    or r.get("op") not in {"assert", "retract", "tombstone"}):
+                raise ProtocolError("invalid change record")
+            for runner in self.runners:
+                if runner.accepts(r):
+                    deliveries.append((runner.emitter.label, r["tx"], r["sequence"], json.dumps(r)))
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.executemany("INSERT OR IGNORE INTO change_inbox VALUES (?,?,?,?)", deliveries)
+            self.conn.execute("INSERT OR REPLACE INTO change_cursor VALUES (1,?)", (cursor,))
+            self.conn.execute("COMMIT")
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        self.lag = watermark - cursor
+        self.ready = True
+        return row is not None and cursor > since and cursor < watermark

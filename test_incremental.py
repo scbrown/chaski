@@ -194,3 +194,147 @@ def test_a_changed_subscription_reconciles_at_once_and_an_unchanged_one_does_not
     calls.clear()
     inc.ChangeRunner(e, conn, Sink()).tick(400)       # and only once
     assert not any(c and c.get("discover") for c in calls)
+
+
+def test_stream_named_graph_delivery_commits_inbox_before_resume(setup):
+    conn, _, runner, _ = setup
+    runner.graphs = {"urn:tests:work-board"}
+    conn.execute("INSERT INTO change_cursor VALUES (1,10)")
+    feed = inc.ChangeFeed(Feed([]), [runner])
+    page = {"records": [change(11, graph="urn:tests:work-board")],
+            "next_tx": 11, "watermark_tx": 12}
+    feed.accept_page(page, 10, stream_id=11)
+    assert conn.execute("SELECT tx FROM change_cursor").fetchone()[0] == 11
+    assert conn.execute("SELECT tx FROM change_inbox").fetchall() == [(11,)]
+    with pytest.raises(ProtocolError):
+        feed.accept_page(page, 10, stream_id=11)
+    assert conn.execute("SELECT COUNT(*) FROM change_inbox").fetchone()[0] == 1
+
+
+def test_stream_failure_never_acknowledges_cursor(setup):
+    conn, _, runner, _ = setup
+    conn.execute("INSERT INTO change_cursor VALUES (1,10)")
+    conn.execute("CREATE TRIGGER refuse_delivery BEFORE INSERT ON change_inbox "
+                 "BEGIN SELECT RAISE(ABORT,'fixture'); END")
+    feed = inc.ChangeFeed(Feed([]), [runner])
+    page = {"records": [change(11)], "next_tx": 11, "watermark_tx": 11}
+    with pytest.raises(Exception, match="fixture"):
+        feed.accept_page(page, 10, stream_id=11)
+    assert conn.execute("SELECT tx FROM change_cursor").fetchone()[0] == 10
+    assert conn.execute("SELECT COUNT(*) FROM change_inbox").fetchone()[0] == 0
+    conn.execute("DROP TRIGGER refuse_delivery")
+    feed.accept_page(page, 10, stream_id=11)
+    assert conn.execute("SELECT tx FROM change_cursor").fetchone()[0] == 11
+
+
+@pytest.mark.parametrize("field,value", [("next_tx",True), ("next_tx",-1), ("watermark_tx",True), ("watermark_tx",9)])
+def test_stream_invalid_prefix_keeps_cursor(setup, field, value):
+    conn, _, runner, _ = setup
+    conn.execute("INSERT INTO change_cursor VALUES (1,10)")
+    feed = inc.ChangeFeed(Feed([]), [runner])
+    page = {"records": [change(11)], "next_tx": 11, "watermark_tx": 11}
+    page[field] = value
+    with pytest.raises(ProtocolError):
+        feed.accept_page(page, 10, stream_id=11)
+    assert conn.execute("SELECT tx FROM change_cursor").fetchone()[0] == 10
+    assert conn.execute("SELECT COUNT(*) FROM change_inbox").fetchone()[0] == 0
+
+
+def test_real_http_stream_reconnect_uses_only_committed_named_graph_cursor(setup):
+    import http.server
+    import threading
+    import time
+    from types import SimpleNamespace
+    from change_stream import ChangeStream
+
+    conn, _, runner, _ = setup
+    runner.graphs = {"urn:tests:work-board"}
+    conn.execute("INSERT INTO change_cursor VALUES (1,10)")
+    observed = []
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            since = int(parse_qs(urlparse(self.path).query)["since"][0])
+            observed.append((since, self.headers.get("Last-Event-ID")))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            if since == 10:
+                page = {"records": [change(11, graph="urn:tests:work-board")],
+                        "next_tx": 11, "watermark_tx": 11}
+                self.wfile.write(('event: quipu.changes\nid: 11\ndata: '+json.dumps(page)+'\n\n').encode())
+                self.wfile.flush()
+        def log_message(self, *args):
+            pass
+    server = http.server.HTTPServer(('127.0.0.1',0),Handler)
+    thread = threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    feed = inc.ChangeFeed(Feed([]),[runner])
+    stream = ChangeStream(SimpleNamespace(base=f'http://127.0.0.1:{server.server_port}'),10)
+    try:
+        deadline = time.monotonic()+4
+        while time.monotonic()<deadline and not any(c==11 for c,_ in observed):
+            stream.pump(feed)
+            time.sleep(.01)
+        assert observed[:2] == [(10,'10'),(11,'11')]
+        assert conn.execute("SELECT tx FROM change_cursor").fetchone()[0] == 11
+        assert conn.execute("SELECT COUNT(*) FROM change_inbox").fetchone()[0] == 1
+    finally:
+        stream.close()
+        server.shutdown()
+        thread.join()
+        server.server_close()
+        stream.thread.join(timeout=2)
+    assert not stream.thread.is_alive()
+
+
+def test_reactor_backlog_drains_event_woken_bounded_turns(setup, tmp_path, monkeypatch):
+    import queue
+    import threading
+    from types import SimpleNamespace
+    import change_stream
+    from chaski import Reactor
+    from change_stream import ChangeStream
+
+    conn, _, runner, _ = setup
+    runner.graphs = {"urn:tests:work-board"}
+    conn.execute("INSERT INTO change_cursor VALUES (1,0)")
+    feed = inc.ChangeFeed(Feed([]), [runner])
+    stream = object.__new__(ChangeStream)
+    stream.cursor = 0
+    stream.pending = queue.Queue(maxsize=1)
+    stream.wakeup = threading.Event()
+
+    # A controlled sender enqueues the next page only after durable ACK. This
+    # pins page-budget yields without depending on OS thread scheduling within
+    # 50ms. The separate clocked control proves the production time-budget yield;
+    # real HTTP controls prove asynchronous delivery/reconnect.
+    monkeypatch.setattr(change_stream.time, 'monotonic', lambda: 0.0)
+    class Ack(threading.Event):
+        def __init__(self, tx):
+            super().__init__()
+            self.tx = tx
+        def set(self):
+            super().set()
+            assert conn.execute("SELECT tx FROM change_cursor").fetchone()[0] == self.tx
+            if self.tx < 13:
+                enqueue(self.tx + 1)
+    def enqueue(tx):
+        graph = "urn:tests:work-board" if tx == 13 else "urn:irrelevant"
+        stream.pending.put_nowait((tx, {'records': [change(tx, graph=graph)],
+                                       'next_tx': tx, 'watermark_tx': 13}, Ack(tx)))
+        stream.wakeup.set()
+    enqueue(1)
+    original_pump = stream.pump
+    stream.pump = lambda incoming: original_pump(incoming, max_pages=3)
+    reactor = Reactor(SimpleNamespace(), [], tmp_path / 'cursor.json', 60)
+    reactor.change_feed, reactor.change_stream = feed, stream
+    adapter_turns = []
+    reactor.runners = [SimpleNamespace(emitter=SimpleNamespace(change_driven=True),
+                                      tick=lambda now: adapter_turns.append((stream.cursor, now)))]
+    for now in range(60, 65):
+        assert stream.wait(0), "remainder must wake the next turn without a five-second sleep"
+        reactor.tick(now)
+    assert adapter_turns == [(3, 60), (6, 61), (9, 62), (12, 63), (13, 64)]
+    assert conn.execute("SELECT tx FROM change_cursor").fetchone()[0] == 13
+    assert conn.execute("SELECT tx FROM change_inbox").fetchall() == [(13,)]
+    assert stream.pending.empty() and stream.pending.maxsize == 1
