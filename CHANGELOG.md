@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0](https://github.com/scbrown/chaski/compare/v0.1.0...v0.2.0) (2026-10-15)
+
+
+### Features
+
+* bridge admitted scheduled slots to signed-run ports ([#24](https://github.com/scbrown/chaski/issues/24)) ([ed83911](https://github.com/scbrown/chaski/commit/ed83911f3e24479e671768d27c74d32a0503fe18))
+* **receiver:** bridge signed phases through the fixed Shuttle CLI ([#26](https://github.com/scbrown/chaski/issues/26)) ([87157ea](https://github.com/scbrown/chaski/commit/87157eaf14e593dcd971733a0a62d679085ece8c))
+* **scheduled:** signed scheduled work chain — receiver, executor, sink factory, catalogue adapter (folds [#28](https://github.com/scbrown/chaski/issues/28)-[#31](https://github.com/scbrown/chaski/issues/31)) ([#31](https://github.com/scbrown/chaski/issues/31)) ([226aba0](https://github.com/scbrown/chaski/commit/226aba02df6272df3e78b4b5f8d3f85494f8f561))
+
 ## 0.1.0 (2026-10-15)
 
 
